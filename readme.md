@@ -55,7 +55,20 @@ https://www.bilibili.com/video/BV1s2FPzqEdA/
   - 对外暴露标准 WebDAV 协议（`/dav/*` 路径）。
   - 支持 macOS Finder、Windows 资源管理器、iOS 文件、Solid Explorer 等客户端直接挂载。
   - 支持 PROPFIND、GET、PUT、DELETE、MKCOL、COPY、MOVE、LOCK 等方法。
+  - 支持 HTTP Range 请求（断点续传）。
+  - 支持 EPUB、MOBI、CBZ、CBR 等电子书 MIME 类型。
   - 使用 Basic Auth 认证，复用现有用户系统。
+
+- **📖 OPDS 目录服务**：
+  - 内置 OPDS 1.1 协议支持（`/opds` 路径），兼容 Reeden、KyBook 等阅读软件。
+  - 自动扫描文件夹，列出所有电子书（EPUB、MOBI、PDF、CBZ、TXT）。
+  - 每个 EPUB 条目自动附带封面图链接，阅读软件可直接获取封面。
+  - 支持文件夹层级浏览。
+
+- **🖼️ EPUB 封面提取**：
+  - 通过 `/api/cover/*` 接口从 EPUB 文件中提取封面图片。
+  - 支持多种封面查找策略（meta cover、properties cover-image、文件名匹配等）。
+  - 提取后自动缓存到 R2，后续请求秒返回。
 
 - **🔧管理后台**：
   - **数据统计**：实时查看总分享数、总浏览量和总下载量。
@@ -190,6 +203,20 @@ Endpoint: `https://<your-worker>.workers.dev/dav/`
 - Cyberduck、Mountain Duck
 - 任何标准 WebDAV 客户端
 
+### OPDS（阅读软件接入）
+
+Endpoint: `https://<your-worker>.workers.dev/opds`
+
+认证方式：使用 EdgeStash 的用户邮箱和密码（Basic Auth）。
+
+支持的客户端：
+- Reeden（iOS/Android）
+- KyBook（iOS）
+- Moon+ Reader（Android）
+- 任何标准 OPDS 阅读器
+
+使用方式：在阅读软件中添加 OPDS 书源，输入上述地址和账号密码即可浏览和下载电子书，封面自动显示。
+
 ### 🔐 安全建议
 
 **⚠️ 重要安全提示：**
@@ -248,6 +275,11 @@ EdgeStash 通过一套 RESTful API 提供服务，以下是核心接口列表。
 | `POST` | `/api/share`                   | 为文件创建分享链接         |
 | `GET`  | `/api/share/:id`               | 获取分享链接信息           |
 | `POST` | `/api/share/:id/download`      | 下载分享的文件             |
+| **管理后台** |                            |                            |
+| **OPDS & 封面** |                            |                            |
+| `GET`  | `/opds`                        | OPDS 根目录（电子书列表）  |
+| `GET`  | `/opds/*`                      | 浏览子文件夹               |
+| `GET`  | `/api/cover/*`                 | 提取 EPUB 封面图片         |
 | **管理后台** |                            |                            |
 | `GET`  | `/api/admin/stats`             | 获取统计数据               |
 | `GET`  | `/api/admin/shares`            | 列出所有分享链接           |
