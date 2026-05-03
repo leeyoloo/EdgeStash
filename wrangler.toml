@@ -1,0 +1,6 @@
+name = "edgestash"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+
+# R2 和 KV 绑定需要在 Cloudflare Dashboard 中配置（Settings → Variables）
+# 这里只声明 binding，具体的 bucket_name / namespace_id 由 Dashboard 绑定覆盖
