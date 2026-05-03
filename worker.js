@@ -5082,11 +5082,23 @@ export default {
         if (path === '/api/auth/check') {
           return await handleCheckAuth(request, env);
         }
-        
+
+        // Copy/Move/List-folders (must be before /api/files catch-all)
+        if (path === '/api/files/copy' && method === 'POST') {
+          return await handleCopyFile(request, env);
+        }
+        if (path === '/api/files/move' && method === 'POST') {
+          return await handleMoveFile(request, env);
+        }
+        if (path === '/api/list-folders' && method === 'GET') {
+          const folderPath = new URL(request.url).searchParams.get('path') || '';
+          return await handleListFolders(request, env, folderPath);
+        }
+
         // File management routes
         if (path.startsWith('/api/files')) {
           const filePath = path.slice('/api/files'.length) || '/';
-          
+
           if (method === 'GET') {
             return await handleListFiles(request, env, filePath);
           }
@@ -5100,26 +5112,10 @@ export default {
             return await handleDeleteFile(request, env, filePath);
           }
         }
-        
+
         // Folder creation
         if (path === '/api/folders' && method === 'POST') {
           return await handleCreateFolder(request, env);
-        }
-
-        // Copy file
-        if (path === '/api/files/copy' && method === 'POST') {
-          return await handleCopyFile(request, env);
-        }
-
-        // Move file
-        if (path === '/api/files/move' && method === 'POST') {
-          return await handleMoveFile(request, env);
-        }
-
-        // List folders (for folder picker)
-        if (path === '/api/list-folders' && method === 'GET') {
-          const folderPath = new URL(request.url).searchParams.get('path') || '';
-          return await handleListFolders(request, env, folderPath);
         }
         
         // Download route
