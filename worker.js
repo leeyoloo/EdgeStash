@@ -165,6 +165,10 @@ function getMimeType(filename) {
     'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     'ppt': 'application/vnd.ms-powerpoint',
     'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    'epub': 'application/epub+zip',
+    'mobi': 'application/x-mobipocket-ebook',
+    'cbz': 'application/x-cbz',
+    'cbr': 'application/x-cbr',
   };
   return mimeTypes[ext] || 'application/octet-stream';
 }
@@ -1678,7 +1682,7 @@ async function handleWebDavRequest(request, env, path) {
     switch (method) {
       case 'OPTIONS': return webDavOptions();
       case 'PROPFIND': return await webDavPropFind(request, env, resourcePath);
-      case 'GET': return await webDavGet(env, resourcePath);
+      case 'GET': return await webDavGet(request, env, resourcePath);
       case 'HEAD': return await webDavHead(env, resourcePath);
       case 'PUT': return await webDavPut(request, env, resourcePath);
       case 'DELETE': return await webDavDelete(env, resourcePath);
@@ -1786,21 +1790,40 @@ async function webDavPropFind(request, env, resourcePath) {
   });
 }
 
-async function webDavGet(env, resourcePath) {
+async function webDavGet(request, env, resourcePath) {
   const key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
   if (!key) return webDavError(400, 'No resource specified');
 
-  const object = await env.R2_BUCKET.get(key);
+  const rangeHeader = request.headers.get('Range');
+  const options = {};
+
+  if (rangeHeader) {
+    const rangeMatch = rangeHeader.match(/bytes=(\d*)-(\d*)/);
+    if (rangeMatch) {
+      if (rangeMatch[1]) options.offset = parseInt(rangeMatch[1]);
+      if (rangeMatch[2] && rangeMatch[1]) options.length = parseInt(rangeMatch[2]) - parseInt(rangeMatch[1]) + 1;
+    }
+  }
+
+  const object = await env.R2_BUCKET.get(key, options);
   if (!object) return webDavError(404, 'Not Found');
+
+  const responseHeaders = {
+    'Content-Type': object.httpMetadata?.contentType || getMimeType(key.split('/').pop()),
+    'Content-Length': object.size,
+    'Last-Modified': (object.uploaded || new Date()).toUTCString(),
+    'ETag': `"${generateId(8)}"`,
+    'Accept-Ranges': 'bytes'
+  };
+
+  if (rangeHeader && options.offset !== undefined) {
+    responseHeaders['Content-Range'] = `bytes ${options.offset}-${options.offset + (options.length || object.size) - 1}/${object.size}`;
+    return new Response(object.body, { status: 206, headers: responseHeaders });
+  }
 
   return new Response(object.body, {
     status: 200,
-    headers: {
-      'Content-Type': object.httpMetadata?.contentType || getMimeType(key.split('/').pop()),
-      'Content-Length': object.size,
-      'Last-Modified': (object.uploaded || new Date()).toUTCString(),
-      'ETag': `"${generateId(8)}"`
-    }
+    headers: responseHeaders
   });
 }
 
@@ -1817,7 +1840,8 @@ async function webDavHead(env, resourcePath) {
       'Content-Type': object.httpMetadata?.contentType || getMimeType(key.split('/').pop()),
       'Content-Length': object.size,
       'Last-Modified': (object.uploaded || new Date()).toUTCString(),
-      'ETag': `"${generateId(8)}"`
+      'ETag': `"${generateId(8)}"`,
+      'Accept-Ranges': 'bytes'
     }
   });
 }
