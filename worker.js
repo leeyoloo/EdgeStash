@@ -681,10 +681,12 @@ async function handleListFiles(request, env, path) {
   if (auth instanceof Response) return auth;
   
   try {
-    // Normalize path
+    // Normalize path - always decode first
     let prefix = path || '';
-    if (prefix && !prefix.endsWith('/')) prefix += '/';
     if (prefix.startsWith('/')) prefix = prefix.slice(1);
+    // Decode in case browser sent encoded path
+    prefix = decodePathSegments(prefix);
+    if (prefix && !prefix.endsWith('/')) prefix += '/';
 
     let listed = await env.R2_BUCKET.list({ prefix, delimiter: '/' });
 
@@ -696,6 +698,19 @@ async function handleListFiles(request, env, path) {
         if (encodedListed.objects.length > 0 || encodedListed.delimitedPrefixes.length > 0) {
           listed = encodedListed;
           prefix = encodedPrefix;
+        }
+      }
+    }
+
+    // Fallback: if still nothing, try the raw path as-is (in case it was already encoded)
+    if (prefix && listed.objects.length === 0 && listed.delimitedPrefixes.length === 0 && path) {
+      let rawPrefix = path.startsWith('/') ? path.slice(1) : path;
+      if (rawPrefix && !rawPrefix.endsWith('/')) rawPrefix += '/';
+      if (rawPrefix !== prefix) {
+        const rawListed = await env.R2_BUCKET.list({ prefix: rawPrefix, delimiter: '/' });
+        if (rawListed.objects.length > 0 || rawListed.delimitedPrefixes.length > 0) {
+          listed = rawListed;
+          prefix = rawPrefix;
         }
       }
     }
