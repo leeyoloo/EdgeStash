@@ -1661,6 +1661,368 @@ async function handleToggleS3Key(request, env, accessKeyId) {
 }
 
 // ============================================================================
+// EPUB COVER EXTRACTION
+// ============================================================================
+
+/**
+ * Minimal ZIP reader - finds and extracts files from a ZIP archive (Uint8Array)
+ * Returns a Map of filename -> Uint8Array
+ */
+function readZipEntries(data) {
+  const entries = new Map();
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+  // Find End of Central Directory
+  let eocdOffset = -1;
+  for (let i = data.length - 22; i >= 0; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) {
+      eocdOffset = i;
+      break;
+    }
+  }
+  if (eocdOffset < 0) return entries;
+
+  const centralDirOffset = dv.getUint32(eocdOffset + 16, true);
+  const numEntries = dv.getUint16(eocdOffset + 10, true);
+  let offset = centralDirOffset;
+
+  for (let n = 0; n < numEntries; n++) {
+    if (dv.getUint32(offset, true) !== 0x02014b50) break;
+    const compMethod = dv.getUint16(offset + 10, true);
+    const compSize = dv.getUint32(offset + 20, true);
+    const uncompSize = dv.getUint32(offset + 24, true);
+    const nameLen = dv.getUint16(offset + 28, true);
+    const extraLen = dv.getUint16(offset + 30, true);
+    const commentLen = dv.getUint16(offset + 32, true);
+    const localHeaderOffset = dv.getUint32(offset + 42, true);
+    const name = new TextDecoder().decode(data.slice(offset + 46, offset + 46 + nameLen));
+
+    // Read from local file header to get actual data
+    const lNameLen = dv.getUint16(localHeaderOffset + 26, true);
+    const lExtraLen = dv.getUint16(localHeaderOffset + 28, true);
+    const dataStart = localHeaderOffset + 30 + lNameLen + lExtraLen;
+    const fileData = data.slice(dataStart, dataStart + compSize);
+
+    if (compMethod === 0) {
+      entries.set(name, fileData);
+    } else if (compMethod === 8) {
+      try {
+        entries.set(name, { compressed: true, data: fileData, size: uncompSize });
+      } catch (e) {
+        // skip
+      }
+    }
+    offset += 46 + nameLen + extraLen + commentLen;
+  }
+  return entries;
+}
+
+/**
+ * Decompress DEFLATE data using DecompressionStream API (available in Workers)
+ */
+async function inflateData(compressed, expectedSize) {
+  const ds = new DecompressionStream('deflate');
+  const writer = ds.writable.getWriter();
+  const reader = ds.readable.getReader();
+
+  writer.write(compressed);
+  writer.close();
+
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.length;
+  }
+
+  const result = new Uint8Array(total);
+  let pos = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, pos);
+    pos += chunk.length;
+  }
+  return result;
+}
+
+/**
+ * Extract cover image from EPUB file data
+ * Returns { data: Uint8Array, mime: string } or null
+ */
+async function extractEpubCover(epubData) {
+  const entries = readZipEntries(new Uint8Array(epubData));
+
+  // 1. Read META-INF/container.xml
+  let containerData = entries.get('META-INF/container.xml');
+  if (!containerData) return null;
+
+  if (containerData.compressed) {
+    containerData = await inflateData(containerData.data, containerData.size);
+  }
+  const containerXml = new TextDecoder().decode(containerData);
+
+  // 2. Find rootfile (content.opf path)
+  const rootfileMatch = containerXml.match(/full-path="([^"]+\.opf)"/i);
+  if (!rootfileMatch) return null;
+  const opfPath = rootfileMatch[1];
+
+  // 3. Read content.opf
+  let opfData = entries.get(opfPath);
+  if (!opfData) return null;
+
+  if (opfData.compressed) {
+    opfData = await inflateData(opfData.data, opfData.size);
+  }
+  const opfXml = new TextDecoder().decode(opfData);
+
+  // 4. Find cover image - try multiple strategies
+  let coverHref = null;
+
+  // Strategy A: <meta name="cover" content="cover-image-id"/>
+  const coverMetaMatch = opfXml.match(/name="cover"\s+content="([^"]+)"/i);
+  if (coverMetaMatch) {
+    const coverId = coverMetaMatch[1];
+    const idRegex = new RegExp(`id="${coverId}"[^>]*href="([^"]+)"`, 'i');
+    const idMatch = opfXml.match(idRegex);
+    if (idMatch) coverHref = idMatch[1];
+  }
+
+  // Strategy B: properties="cover-image" on manifest item
+  if (!coverHref) {
+    const propMatch = opfXml.match(/properties="cover-image"[^>]*href="([^"]+)"/i);
+    if (propMatch) coverHref = propMatch[1];
+  }
+
+  // Strategy C: look for file named cover in manifest
+  if (!coverHref) {
+    const coverFileMatch = opfXml.match(/href="([^"]*cover[^"]*\.(?:jpg|jpeg|png|webp|gif))"/i);
+    if (coverFileMatch) coverHref = coverFileMatch[1];
+  }
+
+  // Strategy D: look for any image with id containing "cover"
+  if (!coverHref) {
+    const coverIdMatch = opfXml.match(/id="[^"]*cover[^"]*"[^>]*href="([^"]+)"/i);
+    if (coverIdMatch) coverHref = coverIdMatch[1];
+  }
+
+  if (!coverHref) return null;
+
+  // 5. Resolve path (opfPath is relative to the epub root)
+  const opfDir = opfPath.includes('/') ? opfPath.substring(0, opfPath.lastIndexOf('/') + 1) : '';
+  // Decode XML entities in href
+  const decodedHref = coverHref.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
+  const coverPath = opfDir + decodedHref;
+
+  // 6. Extract cover image
+  let coverData = entries.get(coverPath);
+  if (!coverData) {
+    // Try URL-encoded version
+    const encodedPath = opfDir + coverHref.split('/').map(encodeURIComponent).join('/');
+    coverData = entries.get(encodedPath);
+  }
+  if (!coverData) return null;
+
+  if (coverData.compressed) {
+    coverData = await inflateData(coverData.data, coverData.size);
+  }
+
+  // 7. Determine MIME type
+  const ext = coverPath.split('.').pop().toLowerCase();
+  const mimeMap = { 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'gif': 'image/gif', 'webp': 'image/webp', 'svg': 'image/svg+xml' };
+  const mime = mimeMap[ext] || 'image/jpeg';
+
+  return { data: coverData, mime };
+}
+
+/**
+ * Handle GET /api/cover/* - Extract and return EPUB cover image
+ */
+async function handleGetCover(env, filePath) {
+  if (!filePath) return jsonResponse({ success: false, message: 'No file specified' }, 400);
+
+  const key = filePath.startsWith('/') ? filePath.slice(1) : filePath;
+  const ext = key.split('.').pop().toLowerCase();
+
+  if (ext !== 'epub') {
+    return jsonResponse({ success: false, message: 'Only EPUB files are supported' }, 400);
+  }
+
+  // Check cache first
+  const cacheKey = '__cover__/' + key;
+  const cached = await env.R2_BUCKET.get(cacheKey);
+  if (cached) {
+    const headers = {
+      'Content-Type': cached.httpMetadata?.contentType || 'image/jpeg',
+      'Cache-Control': 'public, max-age=86400',
+      'Access-Control-Allow-Origin': '*'
+    };
+    return new Response(cached.body, { status: 200, headers });
+  }
+
+  // Download EPUB
+  const object = await env.R2_BUCKET.get(key);
+  if (!object) return jsonResponse({ success: false, message: 'File not found' }, 404);
+
+  const epubBuffer = await object.arrayBuffer();
+
+  try {
+    const cover = await extractEpubCover(epubBuffer);
+    if (!cover) {
+      return jsonResponse({ success: false, message: 'No cover found in EPUB' }, 404);
+    }
+
+    // Cache cover in R2 for future requests
+    await env.R2_BUCKET.put(cacheKey, cover.data, {
+      httpMetadata: { contentType: cover.mime }
+    });
+
+    return new Response(cover.data, {
+      status: 200,
+      headers: {
+        'Content-Type': cover.mime,
+        'Cache-Control': 'public, max-age=86400',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, message: 'Failed to extract cover: ' + e.message }, 500);
+  }
+}
+
+// ============================================================================
+// OPDS CATALOG (for reading apps like Reeden)
+// ============================================================================
+
+async function handleOpdsRequest(request, env, path) {
+  // Auth: Basic or query param token
+  const url = new URL(request.url);
+  let auth = await verifyWebDavAuth(request, env);
+  if (!auth) {
+    return new Response('Unauthorized', {
+      status: 401,
+      headers: { 'WWW-Authenticate': 'Basic realm="EdgeStash OPDS"' }
+    });
+  }
+
+  // /opds or /opds/ - root catalog
+  // /opds/path/to/folder - browse folder
+  // /opds/__cover__/path/to/file.epub - cover image
+  // /opds/__download__/path/to/file.epub - download file
+
+  const opdsPath = path.replace(/^\/opds\/?/, '');
+
+  // Cover image endpoint
+  if (opdsPath.startsWith('__cover__/')) {
+    const filePath = opdsPath.slice('__cover__/'.length);
+    return await handleGetCover(env, filePath);
+  }
+
+  // Download endpoint
+  if (opdsPath.startsWith('__download__/')) {
+    const filePath = opdsPath.slice('__download__/'.length);
+    return await handleDownloadFile(request, env, '/' + filePath);
+  }
+
+  // Browse directory - return OPDS feed
+  const dirPath = opdsPath ? '/' + opdsPath : '/';
+
+  const listed = await env.R2_BUCKET.list({
+    prefix: opdsPath ? opdsPath + '/' : '',
+    delimiter: '/'
+  });
+
+  const baseUrl = url.origin + '/opds';
+  const entries = [];
+
+  // Subfolders as navigation links
+  if (listed.delimitedPrefixes) {
+    for (const folderPrefix of listed.delimitedPrefixes) {
+      const folderName = folderPrefix.slice((opdsPath ? opdsPath + '/' : '').length).replace(/\/$/, '');
+      if (folderName && folderName !== '.folder') {
+        const folderHref = baseUrl + '/' + (opdsPath ? opdsPath + '/' : '') + encodeURIComponent(folderName);
+        entries.push(`  <entry>
+    <title>${escapeXml(folderName)}</title>
+    <id>${escapeXml(folderHref)}</id>
+    <updated>${new Date().toISOString()}</updated>
+    <content type="text">文件夹</content>
+    <link rel="subsection" href="${escapeXml(folderHref)}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  </entry>`);
+      }
+    }
+  }
+
+  // Files as acquisition entries
+  if (listed.objects) {
+    for (const obj of listed.objects) {
+      const name = obj.key.slice((opdsPath ? opdsPath + '/' : '').length);
+      if (!name || name.includes('/') || name === '.folder') continue;
+
+      const ext = name.split('.').pop().toLowerCase();
+      const isBook = ['epub', 'mobi', 'pdf', 'cbz', 'cbr', 'txt'].includes(ext);
+      if (!isBook) continue;
+
+      const encodedName = (opdsPath ? opdsPath + '/' : '') + name.split('/').map(encodeURIComponent).join('/');
+      const downloadUrl = baseUrl + '/__download__/' + encodedName;
+      const coverUrl = ext === 'epub' ? baseUrl + '/__cover__/' + encodedName : '';
+
+      const mimeMap = {
+        'epub': 'application/epub+zip',
+        'mobi': 'application/x-mobipocket-ebook',
+        'pdf': 'application/pdf',
+        'cbz': 'application/x-cbz',
+        'cbr': 'application/x-cbr',
+        'txt': 'text/plain'
+      };
+      const mime = mimeMap[ext] || 'application/octet-stream';
+
+      // Extract title from filename (remove extension)
+      const title = name.replace(/\.[^.]+$/, '');
+
+      // Try to get author from metadata if available
+      const author = '';
+
+      entries.push(`  <entry>
+    <title>${escapeXml(title)}</title>
+    <id>${escapeXml(downloadUrl)}</id>
+    <updated>${(obj.uploaded || new Date()).toISOString()}</updated>
+    ${author ? `<author><name>${escapeXml(author)}</name></author>` : ''}
+    <summary type="text">${escapeXml(name)} (${Math.round(obj.size / 1024)}KB)</summary>
+    ${coverUrl ? `<link rel="http://opds-spec.org/image" href="${escapeXml(coverUrl)}" type="image/jpeg"/>
+    <link rel="http://opds-spec.org/image/thumbnail" href="${escapeXml(coverUrl)}" type="image/jpeg"/>` : ''}
+    <link rel="http://opds-spec.org/acquisition" href="${escapeXml(downloadUrl)}" type="${escapeXml(mime)}"/>
+  </entry>`);
+    }
+  }
+
+  // Build OPDS feed
+  const feedTitle = opdsPath ? decodeURIComponent(opdsPath).split('/').pop() : 'EdgeStash';
+  const parentPath = opdsPath ? opdsPath.split('/').slice(0, -1).join('/') : '';
+
+  const feed = `<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:dc="http://purl.org/dc/terms/"
+      xmlns:opds="http://opds-spec.org/2010/catalog">
+  <title>${escapeXml(feedTitle)}</title>
+  <id>${escapeXml(baseUrl + '/' + opdsPath)}</id>
+  <updated>${new Date().toISOString()}</updated>
+  <author><name>EdgeStash</name></author>
+  <link rel="start" href="${escapeXml(baseUrl)}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
+  ${opdsPath ? `<link rel="up" href="${escapeXml(baseUrl + '/' + parentPath)}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>` : ''}
+  ${entries.join('\n')}
+</feed>`;
+
+  return new Response(feed, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/atom+xml;profile=opds-catalog;kind=acquisition; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-cache'
+    }
+  });
+}
+
+// ============================================================================
 // WEBDAV HANDLERS
 // ============================================================================
 
@@ -4391,6 +4753,11 @@ export default {
         return await handleWebDavRequest(request, env, path);
       }
 
+      // OPDS routes (/opds/*)
+      if (path.startsWith('/opds')) {
+        return await handleOpdsRequest(request, env, path);
+      }
+
       // API Routes
       if (path.startsWith('/api/')) {
         // Auth routes
@@ -4500,6 +4867,12 @@ export default {
         if (path.match(/^\/api\/admin\/s3keys\/[^/]+$/) && method === 'DELETE') {
           const accessKeyId = path.split('/').pop();
           return await handleDeleteS3Key(request, env, accessKeyId);
+        }
+
+        // EPUB 封面提取
+        if (path.startsWith('/api/cover') && method === 'GET') {
+          const filePath = path.slice('/api/cover'.length);
+          return await handleGetCover(env, filePath);
         }
 
         return jsonResponse({ success: false, message: 'API 路径不存在' }, 404);
