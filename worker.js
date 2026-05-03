@@ -803,6 +803,103 @@ async function handleRenameFile(request, env, path) {
   }
 }
 
+async function handleCopyFile(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const body = await request.json();
+    const { source, destination } = body;
+    if (!source || !destination) {
+      return jsonResponse({ success: false, message: '缺少源路径或目标路径' }, 400);
+    }
+
+    let srcKey = source.startsWith('/') ? source.slice(1) : source;
+    let destFolder = destination.startsWith('/') ? destination.slice(1) : destination;
+    if (!destFolder.endsWith('/')) destFolder += '/';
+
+    const fileName = srcKey.split('/').pop();
+    const destKey = destFolder + fileName;
+
+    // Copy file
+    const srcObject = await env.R2_BUCKET.get(srcKey);
+    if (!srcObject) return jsonResponse({ success: false, message: '源文件不存在' }, 404);
+
+    await env.R2_BUCKET.put(destKey, srcObject.body, { httpMetadata: srcObject.httpMetadata });
+
+    return jsonResponse({ success: true, message: '复制成功', newPath: '/' + destKey });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '复制失败: ' + e.message }, 500);
+  }
+}
+
+async function handleMoveFile(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const body = await request.json();
+    const { source, destination } = body;
+    if (!source || !destination) {
+      return jsonResponse({ success: false, message: '缺少源路径或目标路径' }, 400);
+    }
+
+    let srcKey = source.startsWith('/') ? source.slice(1) : source;
+    let destFolder = destination.startsWith('/') ? destination.slice(1) : destination;
+    if (!destFolder.endsWith('/')) destFolder += '/';
+
+    const fileName = srcKey.split('/').pop();
+    const destKey = destFolder + fileName;
+
+    // Check source exists
+    const srcObject = await env.R2_BUCKET.get(srcKey);
+    if (!srcObject) return jsonResponse({ success: false, message: '源文件不存在' }, 404);
+
+    // Copy to destination then delete source
+    await env.R2_BUCKET.put(destKey, srcObject.body, { httpMetadata: srcObject.httpMetadata });
+    await env.R2_BUCKET.delete(srcKey);
+
+    return jsonResponse({ success: true, message: '移动成功', newPath: '/' + destKey });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '移动失败: ' + e.message }, 500);
+  }
+}
+
+async function handleListFolders(request, env, path) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    let prefix = path || '';
+    if (prefix && !prefix.endsWith('/')) prefix += '/';
+    if (prefix.startsWith('/')) prefix = prefix.slice(1);
+
+    const folders = [];
+    // Always include root
+    folders.push({ name: '根目录', path: '/' });
+
+    // List all folders recursively by scanning delimitedPrefixes
+    const listAll = async (p) => {
+      const listed = await env.R2_BUCKET.list({ prefix: p, delimiter: '/' });
+      if (listed.delimitedPrefixes) {
+        for (const fp of listed.delimitedPrefixes) {
+          const name = fp.slice(p.length).replace(/\/$/, '');
+          if (name && name !== '.folder') {
+            const fullPath = '/' + fp.slice(0, -1);
+            folders.push({ name: decodePathSegments(name), path: fullPath });
+            await listAll(fp); // recurse into subfolders
+          }
+        }
+      }
+    };
+    await listAll('');
+
+    return jsonResponse({ success: true, folders });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '获取文件夹列表失败: ' + e.message }, 500);
+  }
+}
+
 async function handleCreateFolder(request, env) {
   const auth = await requireAuth(request, env);
   if (auth instanceof Response) return auth;
@@ -3322,6 +3419,29 @@ const CSS_STYLES = `
     background: var(--surface-light);
   }
   
+  .folder-picker-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    cursor: pointer;
+    transition: background 0.15s;
+    border-radius: 6px;
+    margin: 0 4px;
+  }
+  .folder-picker-item:hover {
+    background: var(--bg-hover);
+  }
+  .folder-picker-item.selected {
+    background: rgba(99, 102, 241, 0.1);
+    color: var(--primary);
+  }
+  .folder-picker-item .picker-icon {
+    font-size: 18px;
+  }
+  .folder-picker-item .picker-indent {
+    display: inline-block;
+  }
   .context-menu-item.danger {
     color: var(--error);
   }
@@ -3575,6 +3695,25 @@ const INDEX_PAGE = `
     </div>
   </div>
   
+  <!-- Folder Picker Modal (Copy / Move) -->
+  <div class="modal-overlay" id="folderPickerModal">
+    <div class="modal" style="max-height: 70vh; display: flex; flex-direction: column;">
+      <div class="modal-header">
+        <div class="modal-title" id="folderPickerTitle">选择目标文件夹</div>
+        <button class="modal-close" onclick="closeModal('folderPickerModal')">&times;</button>
+      </div>
+      <div id="folderPickerList" style="flex: 1; overflow-y: auto; max-height: 40vh; padding: 8px 0;">
+        <div style="text-align:center;padding:20px;"><div class="spinner"></div></div>
+      </div>
+      <div style="padding-top: 12px; border-top: 1px solid var(--border); margin-top: 12px;">
+        <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 8px;">
+          目标路径: <span id="folderPickerSelected" style="color: var(--primary);">/</span>
+        </div>
+        <button class="btn btn-primary" style="width: 100%;" id="folderPickerConfirm">确认</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Preview Modal -->
   <div class="preview-overlay" id="previewOverlay">
     <div class="preview-header">
@@ -3679,6 +3818,7 @@ const INDEX_PAGE = `
             <div class="file-name">\${escapeHtml(folder.name)}</div>
             <div class="file-meta">文件夹</div>
             <div class="file-actions">
+              <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showMoveModal('\${folder.path}')">移动</button>
               <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showRenameModal('\${folder.path}', '\${escapeHtml(folder.name)}')">重命名</button>
               <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteFile('\${folder.path}')">删除</button>
             </div>
@@ -3700,6 +3840,8 @@ const INDEX_PAGE = `
               \${previewType ? '<button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); previewFile(\\'' + file.path + '\\', \\'' + previewType + '\\', \\'' + escapeHtml(file.name) + '\\')">预览</button>' : ''}
               <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); downloadFile('\${file.path}')">下载</button>
               <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showShareModal('\${file.path}')">分享</button>
+              <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showCopyModal('\${file.path}')">复制</button>
+              <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showMoveModal('\${file.path}')">移动</button>
               <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); showRenameModal('\${file.path}', '\${escapeHtml(file.name)}')">重命名</button>
               <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); deleteFile('\${file.path}')">删除</button>
             </div>
@@ -3946,6 +4088,89 @@ const INDEX_PAGE = `
       }
     }
     
+    // ---- Copy / Move ----
+    let _pickerSourcePath = '';
+    let _pickerMode = ''; // 'copy' or 'move'
+    let _pickerSelectedFolder = '/';
+
+    function showCopyModal(path) {
+      _pickerSourcePath = path;
+      _pickerMode = 'copy';
+      _pickerSelectedFolder = '/';
+      document.getElementById('folderPickerTitle').textContent = '复制到…';
+      document.getElementById('folderPickerSelected').textContent = '/';
+      document.getElementById('folderPickerConfirm').onclick = doCopyOrMove;
+      document.getElementById('folderPickerModal').classList.add('active');
+      loadFolderPicker('');
+    }
+
+    function showMoveModal(path) {
+      _pickerSourcePath = path;
+      _pickerMode = 'move';
+      _pickerSelectedFolder = '/';
+      document.getElementById('folderPickerTitle').textContent = '移动到…';
+      document.getElementById('folderPickerSelected').textContent = '/';
+      document.getElementById('folderPickerConfirm').onclick = doCopyOrMove;
+      document.getElementById('folderPickerModal').classList.add('active');
+      loadFolderPicker('');
+    }
+
+    async function loadFolderPicker(prefix) {
+      const container = document.getElementById('folderPickerList');
+      container.innerHTML = '<div style="text-align:center;padding:20px;"><div class="spinner"></div></div>';
+      try {
+        const resp = await fetch('/api/list-folders?path=' + encodeURIComponent(prefix));
+        const data = await resp.json();
+        if (!data.success) {
+          container.innerHTML = '<div style="text-align:center;padding:20px;color:var(--danger);">加载失败</div>';
+          return;
+        }
+        container.innerHTML = '';
+        data.folders.forEach(folder => {
+          const item = document.createElement('div');
+          item.className = 'folder-picker-item' + (folder.path === _pickerSelectedFolder ? ' selected' : '');
+          const depth = folder.path === '/' ? 0 : folder.path.split('/').length - 1;
+          item.innerHTML = '<span class="picker-indent" style="width:' + (depth * 20) + 'px"></span>'
+            + '<span class="picker-icon">📁</span>'
+            + '<span>' + escapeHtml(folder.name) + '</span>';
+          item.onclick = () => {
+            _pickerSelectedFolder = folder.path;
+            document.getElementById('folderPickerSelected').textContent = folder.path;
+            container.querySelectorAll('.folder-picker-item').forEach(el => el.classList.remove('selected'));
+            item.classList.add('selected');
+          };
+          container.appendChild(item);
+        });
+      } catch (e) {
+        container.innerHTML = '<div style="text-align:center;padding:20px;color:var(--danger);">加载失败: ' + e.message + '</div>';
+      }
+    }
+
+    async function doCopyOrMove() {
+      const url = _pickerMode === 'copy' ? '/api/files/copy' : '/api/files/move';
+      const label = _pickerMode === 'copy' ? '复制' : '移动';
+      showLoading(true);
+      closeModal('folderPickerModal');
+      try {
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source: _pickerSourcePath, destination: _pickerSelectedFolder })
+        });
+        const data = await resp.json();
+        if (data.success) {
+          showToast(label + '成功', 'success');
+          loadFiles();
+        } else {
+          showToast(label + '失败: ' + data.message, 'error');
+        }
+      } catch (e) {
+        showToast(label + '失败: ' + e.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
     async function deleteFile(path) {
       if (!confirm('确定要删除吗？此操作不可恢复。')) return;
       
@@ -4879,6 +5104,22 @@ export default {
         // Folder creation
         if (path === '/api/folders' && method === 'POST') {
           return await handleCreateFolder(request, env);
+        }
+
+        // Copy file
+        if (path === '/api/files/copy' && method === 'POST') {
+          return await handleCopyFile(request, env);
+        }
+
+        // Move file
+        if (path === '/api/files/move' && method === 'POST') {
+          return await handleMoveFile(request, env);
+        }
+
+        // List folders (for folder picker)
+        if (path === '/api/list-folders' && method === 'GET') {
+          const folderPath = new URL(request.url).searchParams.get('path') || '';
+          return await handleListFolders(request, env, folderPath);
         }
         
         // Download route
