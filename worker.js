@@ -822,10 +822,18 @@ async function handleCopyFile(request, env) {
     let srcObject = await env.R2_BUCKET.get(srcKey);
     if (!srcObject) {
       const encoded = encodePathSegments(srcKey);
-      if (encoded !== srcKey) srcObject = await env.R2_BUCKET.get(encoded);
-      if (srcObject) srcKey = encoded; // use encoded key for delete later
+      if (encoded !== srcKey) {
+        srcObject = await env.R2_BUCKET.get(encoded);
+        if (srcObject) srcKey = encoded;
+      }
     }
-    if (!srcObject) return jsonResponse({ success: false, message: '源文件不存在' }, 404);
+    if (!srcObject) {
+      // Debug: list what's actually in R2 with similar prefix
+      const prefix = srcKey.includes('/') ? srcKey.substring(0, srcKey.lastIndexOf('/') + 1) : '';
+      const listed = await env.R2_BUCKET.list({ prefix, limit: 10 });
+      const keys = (listed.objects || []).map(o => o.key);
+      return jsonResponse({ success: false, message: '源文件不存在', debug: { tried: [srcKey, encodePathSegments(srcKey)], found: keys } }, 404);
+    }
 
     const fileName = srcKey.split('/').pop();
     const destKey = destFolder + fileName;
@@ -857,10 +865,17 @@ async function handleMoveFile(request, env) {
     let srcObject = await env.R2_BUCKET.get(srcKey);
     if (!srcObject) {
       const encoded = encodePathSegments(srcKey);
-      if (encoded !== srcKey) srcObject = await env.R2_BUCKET.get(encoded);
-      if (srcObject) srcKey = encoded;
+      if (encoded !== srcKey) {
+        srcObject = await env.R2_BUCKET.get(encoded);
+        if (srcObject) srcKey = encoded;
+      }
     }
-    if (!srcObject) return jsonResponse({ success: false, message: '源文件不存在' }, 404);
+    if (!srcObject) {
+      const prefix = srcKey.includes('/') ? srcKey.substring(0, srcKey.lastIndexOf('/') + 1) : '';
+      const listed = await env.R2_BUCKET.list({ prefix, limit: 10 });
+      const keys = (listed.objects || []).map(o => o.key);
+      return jsonResponse({ success: false, message: '源文件不存在', debug: { tried: [srcKey, encodePathSegments(srcKey)], found: keys } }, 404);
+    }
 
     const fileName = srcKey.split('/').pop();
     const destKey = destFolder + fileName;
