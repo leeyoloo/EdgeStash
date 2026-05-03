@@ -2272,7 +2272,8 @@ async function webDavCopy(request, env, resourcePath) {
 
   const srcObject = await env.R2_BUCKET.get(srcKey);
   if (srcObject) {
-    await env.R2_BUCKET.put(destKey, srcObject.body, { httpMetadata: srcObject.httpMetadata });
+    const data = await srcObject.arrayBuffer();
+    await env.R2_BUCKET.put(destKey, data, { httpMetadata: srcObject.httpMetadata });
     return new Response(null, { status: 201 });
   }
 
@@ -2283,7 +2284,8 @@ async function webDavCopy(request, env, resourcePath) {
       const newKey = destKey + '/' + relativePath;
       const objData = await env.R2_BUCKET.get(obj.key);
       if (objData) {
-        await env.R2_BUCKET.put(newKey, objData.body, { httpMetadata: objData.httpMetadata });
+        const data = await objData.arrayBuffer();
+        await env.R2_BUCKET.put(newKey, data, { httpMetadata: objData.httpMetadata });
       }
     }
     return new Response(null, { status: 207 });
@@ -2296,19 +2298,34 @@ async function webDavMove(request, env, resourcePath) {
   const destination = request.headers.get('Destination');
   if (!destination) return webDavError(400, 'Missing Destination header');
 
+  const overwrite = (request.headers.get('Overwrite') || 'T').toUpperCase();
   const srcKey = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
   let destPath;
   try { destPath = new URL(destination).pathname.replace(/^\/dav\/?/, ''); }
   catch (e) { destPath = destination.replace(/^\/dav\/?/, ''); }
   const destKey = destPath.startsWith('/') ? destPath.slice(1) : destPath;
 
+  // If overwrite is 'F' (false), check if destination exists
+  if (overwrite === 'F') {
+    const existing = await env.R2_BUCKET.head(destKey);
+    if (existing) return webDavError(412, 'Precondition Failed');
+  }
+
+  // Delete existing destination if overwrite is 'T' (true) or not specified
+  if (overwrite !== 'F') {
+    try { await env.R2_BUCKET.delete(destKey); } catch (e) { /* ignore */ }
+  }
+
   const srcObject = await env.R2_BUCKET.get(srcKey);
   if (srcObject) {
-    await env.R2_BUCKET.put(destKey, srcObject.body, { httpMetadata: srcObject.httpMetadata });
+    // IMPORTANT: read body into buffer first, then write buffer (not consumed stream)
+    const data = await srcObject.arrayBuffer();
+    await env.R2_BUCKET.put(destKey, data, { httpMetadata: srcObject.httpMetadata });
     await env.R2_BUCKET.delete(srcKey);
     return new Response(null, { status: 201 });
   }
 
+  // Try as folder
   const listed = await env.R2_BUCKET.list({ prefix: srcKey + '/' });
   if (listed.objects && listed.objects.length > 0) {
     for (const obj of listed.objects) {
@@ -2316,7 +2333,8 @@ async function webDavMove(request, env, resourcePath) {
       const newKey = destKey + '/' + relativePath;
       const objData = await env.R2_BUCKET.get(obj.key);
       if (objData) {
-        await env.R2_BUCKET.put(newKey, objData.body, { httpMetadata: objData.httpMetadata });
+        const data = await objData.arrayBuffer();
+        await env.R2_BUCKET.put(newKey, data, { httpMetadata: objData.httpMetadata });
       }
       await env.R2_BUCKET.delete(obj.key);
     }
