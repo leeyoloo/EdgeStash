@@ -818,12 +818,17 @@ async function handleCopyFile(request, env) {
     let destFolder = destination.startsWith('/') ? destination.slice(1) : destination;
     if (!destFolder.endsWith('/')) destFolder += '/';
 
+    // Fallback: try encoded key for files uploaded before URL-decode fix
+    let srcObject = await env.R2_BUCKET.get(srcKey);
+    if (!srcObject) {
+      const encoded = encodePathSegments(srcKey);
+      if (encoded !== srcKey) srcObject = await env.R2_BUCKET.get(encoded);
+      if (srcObject) srcKey = encoded; // use encoded key for delete later
+    }
+    if (!srcObject) return jsonResponse({ success: false, message: '源文件不存在' }, 404);
+
     const fileName = srcKey.split('/').pop();
     const destKey = destFolder + fileName;
-
-    // Copy file
-    const srcObject = await env.R2_BUCKET.get(srcKey);
-    if (!srcObject) return jsonResponse({ success: false, message: '源文件不存在' }, 404);
 
     await env.R2_BUCKET.put(destKey, srcObject.body, { httpMetadata: srcObject.httpMetadata });
 
@@ -848,12 +853,17 @@ async function handleMoveFile(request, env) {
     let destFolder = destination.startsWith('/') ? destination.slice(1) : destination;
     if (!destFolder.endsWith('/')) destFolder += '/';
 
+    // Fallback: try encoded key for files uploaded before URL-decode fix
+    let srcObject = await env.R2_BUCKET.get(srcKey);
+    if (!srcObject) {
+      const encoded = encodePathSegments(srcKey);
+      if (encoded !== srcKey) srcObject = await env.R2_BUCKET.get(encoded);
+      if (srcObject) srcKey = encoded;
+    }
+    if (!srcObject) return jsonResponse({ success: false, message: '源文件不存在' }, 404);
+
     const fileName = srcKey.split('/').pop();
     const destKey = destFolder + fileName;
-
-    // Check source exists
-    const srcObject = await env.R2_BUCKET.get(srcKey);
-    if (!srcObject) return jsonResponse({ success: false, message: '源文件不存在' }, 404);
 
     // Copy to destination then delete source
     await env.R2_BUCKET.put(destKey, srcObject.body, { httpMetadata: srcObject.httpMetadata });
