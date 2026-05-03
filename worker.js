@@ -1,5 +1,5 @@
 /**
- * EdgeStash - Cloudflare-based Cloud Drive
+ * leeyolo的私有云盘 - Cloudflare-based Cloud Drive
  * 
  * A complete cloud storage solution built on Cloudflare Worker, R2, and KV.
  * 
@@ -2050,7 +2050,7 @@ async function handleOpdsRequest(request, env, path) {
   if (!auth) {
     return new Response('Unauthorized', {
       status: 401,
-      headers: { 'WWW-Authenticate': 'Basic realm="EdgeStash OPDS"' }
+      headers: { 'WWW-Authenticate': 'Basic realm="leeyolo的私有云盘 OPDS"' }
     });
   }
 
@@ -2145,7 +2145,7 @@ async function handleOpdsRequest(request, env, path) {
   }
 
   // Build OPDS feed
-  const feedTitle = opdsPath ? decodeURIComponent(opdsPath).split('/').pop() : 'EdgeStash';
+  const feedTitle = opdsPath ? decodeURIComponent(opdsPath).split('/').pop() : 'leeyolo的私有云盘';
   const parentPath = opdsPath ? opdsPath.split('/').slice(0, -1).join('/') : '';
 
   const feed = `<?xml version="1.0" encoding="utf-8"?>
@@ -2155,7 +2155,7 @@ async function handleOpdsRequest(request, env, path) {
   <title>${escapeXml(feedTitle)}</title>
   <id>${escapeXml(baseUrl + '/' + opdsPath)}</id>
   <updated>${new Date().toISOString()}</updated>
-  <author><name>EdgeStash</name></author>
+  <author><name>leeyolo的私有云盘</name></author>
   <link rel="start" href="${escapeXml(baseUrl)}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
   ${opdsPath ? `<link rel="up" href="${escapeXml(baseUrl + '/' + parentPath)}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>` : ''}
   ${entries.join('\n')}
@@ -2182,7 +2182,7 @@ async function handleWebDavRequest(request, env, path) {
   if (!auth) {
     return new Response('Unauthorized', {
       status: 401,
-      headers: { 'WWW-Authenticate': 'Basic realm="EdgeStash WebDAV"' }
+      headers: { 'WWW-Authenticate': 'Basic realm="leeyolo的私有云盘 WebDAV"' }
     });
   }
 
@@ -3481,14 +3481,14 @@ const LOGIN_PAGE = `
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>登录 - EdgeStash</title>
+  <title>登录 - leeyolo的私有云盘</title>
   ${CSS_STYLES}
 </head>
 <body>
   <div class="login-container">
     <div class="login-card">
       <div class="login-header">
-        <div class="login-logo">EdgeStash</div>
+        <div class="login-logo">leeyolo的私有云盘</div>
         <div class="login-subtitle">基于 Cloudflare 的云盘服务</div>
       </div>
       
@@ -3582,14 +3582,14 @@ const INDEX_PAGE = `
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EdgeStash - 云盘</title>
+  <title>leeyolo的私有云盘</title>
   ${CSS_STYLES}
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
 </head>
 <body>
   <div class="header">
-    <div class="logo">EdgeStash</div>
+    <div class="logo">leeyolo的私有云盘</div>
     <div class="header-actions">
       <button class="btn btn-secondary" onclick="window.location.href='/admin.html'">管理后台</button>
       <button class="btn btn-secondary" onclick="logout()">退出登录</button>
@@ -4295,12 +4295,12 @@ const ADMIN_PAGE = `
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>管理后台 - EdgeStash</title>
+  <title>管理后台 - leeyolo的私有云盘</title>
   ${CSS_STYLES}
 </head>
 <body>
   <div class="header">
-    <div class="logo">EdgeStash 管理后台</div>
+    <div class="logo">leeyolo的私有云盘 管理后台</div>
     <div class="header-actions">
       <button class="btn btn-secondary" onclick="window.location.href='/'">返回云盘</button>
       <button class="btn btn-secondary" onclick="logout()">退出登录</button>
@@ -4881,7 +4881,7 @@ const SHARE_PAGE = `
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>文件分享 - EdgeStash</title>
+  <title>文件分享 - leeyolo的私有云盘</title>
   ${CSS_STYLES}
 </head>
 <body>
