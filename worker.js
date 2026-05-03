@@ -250,6 +250,262 @@ function htmlResponse(html, status = 200, headers = {}) {
 }
 
 // ============================================================================
+// S3 & WEBDAV HELPERS
+// ============================================================================
+
+/**
+ * Convert ArrayBuffer to hex string
+ */
+function bufferToHex(buffer) {
+  return Array.from(new Uint8Array(buffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+/**
+ * HMAC-SHA256 returning hex string
+ */
+async function hmacHex(key, data) {
+  const encoder = new TextEncoder();
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    typeof key === 'string' ? encoder.encode(key) : key,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(data));
+  return bufferToHex(sig);
+}
+
+/**
+ * HMAC-SHA256 returning raw ArrayBuffer
+ */
+async function hmacRaw(key, data) {
+  const encoder = new TextEncoder();
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    typeof key === 'string' ? encoder.encode(key) : key,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  return await crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(data));
+}
+
+/**
+ * SHA-256 hash returning hex string
+ */
+async function sha256Hex(data) {
+  const encoder = new TextEncoder();
+  const hash = await crypto.subtle.digest('SHA-256', encoder.encode(data));
+  return bufferToHex(hash);
+}
+
+/**
+ * Compute S3 Signature V4 signing key
+ */
+async function computeSigningKey(secretKey, dateStamp, region, service) {
+  let key = await hmacRaw('AWS4' + secretKey, dateStamp);
+  key = await hmacRaw(key, region);
+  key = await hmacRaw(key, service);
+  key = await hmacRaw(key, 'aws4_request');
+  return key;
+}
+
+/**
+ * Parse S3 Authorization header
+ */
+function parseS3AuthHeader(authHeader) {
+  if (!authHeader || !authHeader.startsWith('AWS4-HMAC-SHA256 ')) return null;
+
+  const parts = authHeader.slice('AWS4-HMAC-SHA256 '.length);
+  const credMatch = parts.match(/Credential=([^,]+)/);
+  const signedMatch = parts.match(/SignedHeaders=([^,]+)/);
+  const sigMatch = parts.match(/Signature=(.+)/);
+
+  if (!credMatch || !signedMatch || !sigMatch) return null;
+
+  const credParts = credMatch[1].split('/');
+  if (credParts.length !== 5) return null;
+
+  return {
+    accessKeyId: credParts[0],
+    dateStamp: credParts[1],
+    region: credParts[2],
+    service: credParts[3],
+    signedHeaders: signedMatch[1],
+    signature: sigMatch[1]
+  };
+}
+
+/**
+ * Build canonical headers string from request
+ */
+function getCanonicalHeaders(request, signedHeaders) {
+  const headers = signedHeaders.split(';');
+  let canonical = '';
+  for (const name of headers) {
+    const value = request.headers.get(name) || '';
+    canonical += name.toLowerCase() + ':' + value.trim() + '\n';
+  }
+  return canonical;
+}
+
+/**
+ * Verify S3 Signature V4
+ */
+async function verifyS3Signature(request, env) {
+  const authHeader = request.headers.get('Authorization');
+  const authInfo = parseS3AuthHeader(authHeader);
+
+  if (!authInfo) return { valid: false, error: 'Invalid Authorization header' };
+
+  const keyData = await env.KV_STORE.get(`s3key:${authInfo.accessKeyId}`);
+  if (!keyData) return { valid: false, error: 'Unknown access key' };
+
+  const key = JSON.parse(keyData);
+  if (key.status === 'disabled') return { valid: false, error: 'Key disabled' };
+
+  const url = new URL(request.url);
+  const canonicalUri = url.pathname || '/';
+  const canonicalQueryString = [...url.searchParams.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join('&');
+
+  const canonicalHeaders = getCanonicalHeaders(request, authInfo.signedHeaders);
+  const payloadHash = request.headers.get('x-amz-content-sha256') || 'UNSIGNED-PAYLOAD';
+
+  const canonicalRequest = [
+    request.method,
+    canonicalUri,
+    canonicalQueryString,
+    canonicalHeaders,
+    authInfo.signedHeaders,
+    payloadHash
+  ].join('\n');
+
+  const amzDate = request.headers.get('x-amz-date') || '';
+  const credentialScope = `${authInfo.dateStamp}/${authInfo.region}/${authInfo.service}/aws4_request`;
+
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    await sha256Hex(canonicalRequest)
+  ].join('\n');
+
+  const signingKey = await computeSigningKey(
+    key.secretKey,
+    authInfo.dateStamp,
+    authInfo.region,
+    authInfo.service
+  );
+
+  const computedSig = await hmacHex(signingKey, stringToSign);
+
+  if (computedSig !== authInfo.signature) {
+    return { valid: false, error: 'Signature mismatch' };
+  }
+
+  return { valid: true, accessKeyId: authInfo.accessKeyId, keyData: key };
+}
+
+/**
+ * S3-style XML error response
+ */
+function s3ErrorResponse(code, message, resource, requestId) {
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>${code}</Code>
+  <Message>${escapeXml(message)}</Message>
+  <Resource>${escapeXml(resource || '/')}</Resource>
+  <RequestId>${requestId || generateId(16)}</RequestId>
+</Error>`;
+  return new Response(xml, {
+    status: code === 'NoSuchKey' ? 404 : code === 'AccessDenied' ? 403 : 400,
+    headers: { 'Content-Type': 'application/xml' }
+  });
+}
+
+/**
+ * Escape XML special characters
+ */
+function escapeXml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/**
+ * Format date for S3 XML responses (ISO 8601)
+ */
+function s3IsoDate(date) {
+  return date.toISOString().replace(/\.\d{3}Z$/, '.000Z');
+}
+
+/**
+ * Format date for S3 Last-Modified header (RFC 1123)
+ */
+function s3Rfc1123Date(date) {
+  return date.toUTCString();
+}
+
+/**
+ * Build WebDAV PROPFIND XML response for a single resource
+ */
+function webDavPropResponse(href, resourceType, contentLength, lastModified, contentType, isCollection) {
+  const now = new Date();
+  const lm = lastModified ? new Date(lastModified) : now;
+
+  let resourceTypeXml = '';
+  if (isCollection) {
+    resourceTypeXml = '<D:resourcetype><D:collection/></D:resourcetype>';
+  } else {
+    resourceTypeXml = '<D:resourcetype/>';
+  }
+
+  return `  <D:response>
+    <D:href>${escapeXml(href)}</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getlastmodified>${lm.toUTCString()}</D:getlastmodified>
+        ${resourceTypeXml}
+        ${!isCollection ? `<D:getcontentlength>${contentLength || 0}</D:getcontentlength>` : ''}
+        ${!isCollection && contentType ? `<D:getcontenttype>${escapeXml(contentType)}</D:getcontenttype>` : ''}
+        <D:creationdate>${lm.toISOString()}</D:creationdate>
+        <D:displayname>${escapeXml(href.split('/').filter(Boolean).pop() || '')}</D:displayname>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>`;
+}
+
+/**
+ * Build complete WebDAV PROPFIND multistatus response
+ */
+function webDavMultistatus(responses) {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+${responses}
+</D:multistatus>`;
+}
+
+/**
+ * WebDAV error response
+ */
+function webDavError(status, message) {
+  return new Response(message, {
+    status,
+    headers: { 'Content-Type': 'text/plain' }
+  });
+}
+
+// ============================================================================
 // AUTHENTICATION HANDLERS
 // ============================================================================
 
@@ -878,6 +1134,848 @@ async function handleCheckAuth(request, env) {
     return jsonResponse({ authenticated: false });
   }
   return jsonResponse({ authenticated: true, role: auth.role, email: auth.email });
+}
+
+// ============================================================================
+// S3 API HANDLERS
+// ============================================================================
+
+/**
+ * Handle S3 requests - intercept and route
+ * Returns null if not an S3 request
+ */
+async function handleS3Request(request, env) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const method = request.method;
+  const authHeader = request.headers.get('Authorization');
+
+  if (!authHeader || !authHeader.startsWith('AWS4-HMAC-SHA256 ')) {
+    return null;
+  }
+
+  const authResult = await verifyS3Signature(request, env);
+  if (!authResult.valid) {
+    return s3ErrorResponse('SignatureDoesNotMatch', authResult.error, path);
+  }
+
+  const pathParts = path.split('/').filter(Boolean);
+  const bucket = pathParts[0] || null;
+  const key = pathParts.slice(1).join('/') || null;
+
+  try {
+    if (!bucket && method === 'GET') {
+      return await s3ListBuckets(request, env, authResult);
+    }
+
+    if (bucket && !key) {
+      if (method === 'GET') {
+        return await s3ListObjectsV2(request, env, authResult, bucket, url);
+      }
+      if (method === 'PUT') {
+        return await s3CreateBucket(request, env, authResult, bucket);
+      }
+      if (method === 'DELETE') {
+        return await s3DeleteBucket(request, env, authResult, bucket);
+      }
+      if (method === 'HEAD') {
+        return await s3HeadBucket(request, env, authResult, bucket);
+      }
+      if (method === 'POST' && url.searchParams.has('uploads')) {
+        return await s3CreateMultipartUpload(request, env, authResult, bucket, key || '', url);
+      }
+    }
+
+    if (bucket && key) {
+      if (method === 'POST' && url.searchParams.has('uploadId')) {
+        return await s3CompleteMultipartUpload(request, env, authResult, bucket, key, url);
+      }
+      if (method === 'DELETE' && url.searchParams.has('uploadId')) {
+        return await s3AbortMultipartUpload(request, env, authResult, bucket, key, url);
+      }
+      if (method === 'PUT' && url.searchParams.has('uploadId') && url.searchParams.has('partNumber')) {
+        return await s3UploadPart(request, env, authResult, bucket, key, url);
+      }
+      if (method === 'GET') {
+        return await s3GetObject(request, env, authResult, bucket, key);
+      }
+      if (method === 'HEAD') {
+        return await s3HeadObject(request, env, authResult, bucket, key);
+      }
+      if (method === 'PUT') {
+        const copySource = request.headers.get('x-amz-copy-source');
+        if (copySource) {
+          return await s3CopyObject(request, env, authResult, bucket, key, copySource);
+        }
+        return await s3PutObject(request, env, authResult, bucket, key, request);
+      }
+      if (method === 'DELETE') {
+        return await s3DeleteObject(request, env, authResult, bucket, key);
+      }
+    }
+
+    return s3ErrorResponse('NoSuchKey', 'The specified key does not exist.', path);
+  } catch (e) {
+    return s3ErrorResponse('InternalError', 'Internal server error: ' + e.message, path);
+  }
+}
+
+async function s3ListBuckets(request, env, auth) {
+  const requestId = generateId(16);
+  const now = s3IsoDate(new Date());
+  const listed = await env.R2_BUCKET.list({ prefix: '', delimiter: '/' });
+  const buckets = [];
+
+  if (listed.delimitedPrefixes) {
+    for (const prefix of listed.delimitedPrefixes) {
+      const name = prefix.replace(/\/$/, '');
+      if (name) buckets.push({ name, creationDate: now });
+    }
+  }
+
+  let bucketsXml = '';
+  for (const b of buckets) {
+    bucketsXml += `    <Bucket>
+      <Name>${escapeXml(b.name)}</Name>
+      <CreationDate>${b.creationDate}</CreationDate>
+    </Bucket>\n`;
+  }
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Owner>
+    <ID>${auth.accessKeyId}</ID>
+    <DisplayName>${auth.accessKeyId}</DisplayName>
+  </Owner>
+  <Buckets>
+${bucketsXml}  </Buckets>
+</ListAllMyBucketsResult>`;
+
+  return new Response(xml, {
+    status: 200,
+    headers: { 'Content-Type': 'application/xml', 'x-amz-request-id': requestId }
+  });
+}
+
+async function s3ListObjectsV2(request, env, auth, bucket, url) {
+  const requestId = generateId(16);
+  const prefix = url.searchParams.get('prefix') || '';
+  const delimiter = url.searchParams.get('delimiter') || '';
+  const maxKeys = parseInt(url.searchParams.get('max-keys') || '1000');
+  const continuationToken = url.searchParams.get('continuation-token');
+
+  let r2Prefix = bucket + '/';
+  if (prefix) {
+    r2Prefix = prefix.startsWith(bucket + '/') ? prefix : bucket + '/' + prefix;
+  }
+
+  const listOptions = { prefix: r2Prefix, limit: maxKeys };
+  if (delimiter) listOptions.delimiter = delimiter;
+  if (continuationToken) listOptions.cursor = continuationToken;
+
+  const listed = await env.R2_BUCKET.list(listOptions);
+  let contentsXml = '';
+  let commonPrefixesXml = '';
+  let count = 0;
+
+  if (listed.objects) {
+    for (const obj of listed.objects) {
+      if (obj.key.endsWith('.folder')) continue;
+      count++;
+      contentsXml += `    <Contents>
+      <Key>${escapeXml(obj.key)}</Key>
+      <LastModified>${s3IsoDate(obj.uploaded || new Date())}</LastModified>
+      <Size>${obj.size}</Size>
+      <ETag>"${generateId(8)}"</ETag>
+      <StorageClass>STANDARD</StorageClass>
+    </Contents>\n`;
+    }
+  }
+
+  if (listed.delimitedPrefixes) {
+    for (const p of listed.delimitedPrefixes) {
+      commonPrefixesXml += `    <CommonPrefixes>
+      <Prefix>${escapeXml(p)}</Prefix>
+    </CommonPrefixes>\n`;
+      count++;
+    }
+  }
+
+  const isTruncated = listed.truncated ? 'true' : 'false';
+  const nextToken = listed.truncated ? listed.cursor : '';
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>${escapeXml(bucket)}</Name>
+  <Prefix>${escapeXml(prefix)}</Prefix>
+  <KeyCount>${count}</KeyCount>
+  <MaxKeys>${maxKeys}</MaxKeys>
+  <Delimiter>${escapeXml(delimiter)}</Delimiter>
+  <IsTruncated>${isTruncated}</IsTruncated>
+  ${nextToken ? `<NextContinuationToken>${escapeXml(nextToken)}</NextContinuationToken>` : ''}
+${contentsXml}${commonPrefixesXml}</ListBucketResult>`;
+
+  return new Response(xml, {
+    status: 200,
+    headers: { 'Content-Type': 'application/xml', 'x-amz-request-id': requestId }
+  });
+}
+
+async function s3HeadBucket(request, env, auth, bucket) {
+  const listed = await env.R2_BUCKET.list({ prefix: bucket + '/', limit: 1 });
+  if ((!listed.objects || listed.objects.length === 0) &&
+      (!listed.delimitedPrefixes || listed.delimitedPrefixes.length === 0)) {
+    return new Response(null, { status: 404 });
+  }
+  return new Response(null, { status: 200 });
+}
+
+async function s3CreateBucket(request, env, auth, bucket) {
+  await env.R2_BUCKET.put(bucket + '/.folder', new Uint8Array(0));
+  return new Response(null, {
+    status: 200,
+    headers: { 'x-amz-request-id': generateId(16) }
+  });
+}
+
+async function s3DeleteBucket(request, env, auth, bucket) {
+  let cursor;
+  do {
+    const batch = await env.R2_BUCKET.list({ prefix: bucket + '/', cursor });
+    if (batch.objects && batch.objects.length > 0) {
+      await env.R2_BUCKET.delete(batch.objects.map(obj => obj.key));
+    }
+    cursor = batch.truncated ? batch.cursor : null;
+  } while (cursor);
+  return new Response(null, { status: 204 });
+}
+
+async function s3GetObject(request, env, auth, bucket, key) {
+  const fullKey = bucket + '/' + key;
+  const rangeHeader = request.headers.get('Range');
+  const options = {};
+
+  if (rangeHeader) {
+    const rangeMatch = rangeHeader.match(/bytes=(\d*)-(\d*)/);
+    if (rangeMatch) {
+      if (rangeMatch[1]) options.offset = parseInt(rangeMatch[1]);
+      if (rangeMatch[2] && rangeMatch[1]) options.length = parseInt(rangeMatch[2]) - parseInt(rangeMatch[1]) + 1;
+    }
+  }
+
+  const object = await env.R2_BUCKET.get(fullKey, options);
+  if (!object) {
+    return s3ErrorResponse('NoSuchKey', 'The specified key does not exist.', fullKey);
+  }
+
+  const responseHeaders = {
+    'Content-Type': object.httpMetadata?.contentType || getMimeType(key.split('/').pop()),
+    'ETag': `"${generateId(8)}"`,
+    'Last-Modified': s3Rfc1123Date(object.uploaded || new Date()),
+    'Content-Length': object.size,
+    'x-amz-request-id': generateId(16),
+    'Accept-Ranges': 'bytes'
+  };
+
+  if (rangeHeader && options.offset !== undefined) {
+    responseHeaders['Content-Range'] = `bytes ${options.offset}-${options.offset + (options.length || object.size) - 1}/${object.size}`;
+    return new Response(object.body, { status: 206, headers: responseHeaders });
+  }
+
+  return new Response(object.body, { status: 200, headers: responseHeaders });
+}
+
+async function s3HeadObject(request, env, auth, bucket, key) {
+  const fullKey = bucket + '/' + key;
+  const object = await env.R2_BUCKET.head(fullKey);
+  if (!object) return new Response(null, { status: 404 });
+
+  return new Response(null, {
+    status: 200,
+    headers: {
+      'Content-Type': object.httpMetadata?.contentType || getMimeType(key.split('/').pop()),
+      'Content-Length': object.size,
+      'ETag': `"${generateId(8)}"`,
+      'Last-Modified': s3Rfc1123Date(object.uploaded || new Date()),
+      'x-amz-request-id': generateId(16),
+      'Accept-Ranges': 'bytes'
+    }
+  });
+}
+
+async function s3PutObject(request, env, auth, bucket, key) {
+  const fullKey = bucket + '/' + key;
+  const contentType = request.headers.get('Content-Type') || getMimeType(key.split('/').pop());
+
+  await env.R2_BUCKET.put(fullKey, request.body, {
+    httpMetadata: { contentType }
+  });
+
+  try { await env.R2_BUCKET.delete(bucket + '/.folder'); } catch (e) { /* ignore */ }
+
+  return new Response(null, {
+    status: 200,
+    headers: { 'ETag': `"${generateId(16)}"`, 'x-amz-request-id': generateId(16) }
+  });
+}
+
+async function s3DeleteObject(request, env, auth, bucket, key) {
+  const fullKey = bucket + '/' + key;
+  await env.R2_BUCKET.delete(fullKey);
+  return new Response(null, { status: 204, headers: { 'x-amz-request-id': generateId(16) } });
+}
+
+async function s3CopyObject(request, env, auth, destBucket, destKey, copySource) {
+  let srcPath = copySource;
+  if (srcPath.startsWith('/')) srcPath = srcPath.slice(1);
+
+  const srcObject = await env.R2_BUCKET.get(srcPath);
+  if (!srcObject) {
+    return s3ErrorResponse('NoSuchKey', 'The specified source key does not exist.', copySource);
+  }
+
+  const destFullKey = destBucket + '/' + destKey;
+  await env.R2_BUCKET.put(destFullKey, srcObject.body, {
+    httpMetadata: srcObject.httpMetadata
+  });
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<CopyObjectResult>
+  <ETag>"${generateId(16)}"</ETag>
+  <LastModified>${s3IsoDate(new Date())}</LastModified>
+</CopyObjectResult>`;
+
+  return new Response(xml, { status: 200, headers: { 'Content-Type': 'application/xml' } });
+}
+
+// ============================================================================
+// S3 MULTIPART UPLOAD HANDLERS
+// ============================================================================
+
+async function s3CreateMultipartUpload(request, env, auth, bucket, key, url) {
+  const uploadId = generateId(32);
+  const uploadData = {
+    bucket, key, uploadId,
+    initiated: Date.now(),
+    parts: {},
+    contentType: request.headers.get('Content-Type') || 'application/octet-stream'
+  };
+
+  await env.KV_STORE.put(`mpu:${uploadId}`, JSON.stringify(uploadData), { expirationTtl: 86400 });
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>${escapeXml(bucket)}</Bucket>
+  <Key>${escapeXml(key || '')}</Key>
+  <UploadId>${uploadId}</UploadId>
+</InitiateMultipartUploadResult>`;
+
+  return new Response(xml, { status: 200, headers: { 'Content-Type': 'application/xml' } });
+}
+
+async function s3UploadPart(request, env, auth, bucket, key, url) {
+  const uploadId = url.searchParams.get('uploadId');
+  const partNumber = url.searchParams.get('partNumber');
+
+  const uploadDataStr = await env.KV_STORE.get(`mpu:${uploadId}`);
+  if (!uploadDataStr) {
+    return s3ErrorResponse('NoSuchUpload', 'The specified upload does not exist.', `uploadId=${uploadId}`);
+  }
+
+  const partKey = `_mpu_/${uploadId}/part-${partNumber}`;
+  const body = await request.arrayBuffer();
+  await env.R2_BUCKET.put(partKey, body);
+
+  const etag = generateId(16);
+  const uploadData = JSON.parse(uploadDataStr);
+  uploadData.parts[partNumber] = { etag, size: body.byteLength, partKey };
+  await env.KV_STORE.put(`mpu:${uploadId}`, JSON.stringify(uploadData), { expirationTtl: 86400 });
+
+  return new Response(null, {
+    status: 200,
+    headers: { 'ETag': `"${etag}"`, 'x-amz-request-id': generateId(16) }
+  });
+}
+
+async function s3CompleteMultipartUpload(request, env, auth, bucket, key, url) {
+  const uploadId = url.searchParams.get('uploadId');
+  const uploadDataStr = await env.KV_STORE.get(`mpu:${uploadId}`);
+  if (!uploadDataStr) {
+    return s3ErrorResponse('NoSuchUpload', 'The specified upload does not exist.', `uploadId=${uploadId}`);
+  }
+
+  const uploadData = JSON.parse(uploadDataStr);
+  const fullKey = bucket + '/' + key;
+  const partNumbers = Object.keys(uploadData.parts).map(Number).sort((a, b) => a - b);
+
+  const partBodies = [];
+  let totalSize = 0;
+
+  for (const pn of partNumbers) {
+    const partInfo = uploadData.parts[pn];
+    const partObj = await env.R2_BUCKET.get(partInfo.partKey);
+    if (partObj) {
+      const ab = await partObj.arrayBuffer();
+      partBodies.push(ab);
+      totalSize += ab.byteLength;
+    }
+  }
+
+  const combined = new Uint8Array(totalSize);
+  let offset = 0;
+  for (const ab of partBodies) {
+    combined.set(new Uint8Array(ab), offset);
+    offset += ab.byteLength;
+  }
+
+  await env.R2_BUCKET.put(fullKey, combined, {
+    httpMetadata: { contentType: uploadData.contentType || getMimeType(key.split('/').pop()) }
+  });
+
+  for (const pn of partNumbers) {
+    try { await env.R2_BUCKET.delete(uploadData.parts[pn].partKey); } catch (e) { /* ignore */ }
+  }
+  await env.KV_STORE.delete(`mpu:${uploadId}`);
+  try { await env.R2_BUCKET.delete(bucket + '/.folder'); } catch (e) { /* ignore */ }
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Location>https://edgestash/${escapeXml(fullKey)}</Location>
+  <Bucket>${escapeXml(bucket)}</Bucket>
+  <Key>${escapeXml(key)}</Key>
+  <ETag>"${generateId(16)}"</ETag>
+</CompleteMultipartUploadResult>`;
+
+  return new Response(xml, { status: 200, headers: { 'Content-Type': 'application/xml' } });
+}
+
+async function s3AbortMultipartUpload(request, env, auth, bucket, key, url) {
+  const uploadId = url.searchParams.get('uploadId');
+  const uploadDataStr = await env.KV_STORE.get(`mpu:${uploadId}`);
+  if (uploadDataStr) {
+    const uploadData = JSON.parse(uploadDataStr);
+    for (const pn of Object.keys(uploadData.parts)) {
+      try { await env.R2_BUCKET.delete(uploadData.parts[pn].partKey); } catch (e) { /* ignore */ }
+    }
+    await env.KV_STORE.delete(`mpu:${uploadId}`);
+  }
+  return new Response(null, { status: 204 });
+}
+
+// ============================================================================
+// S3 KEY MANAGEMENT API HANDLERS
+// ============================================================================
+
+async function handleListS3Keys(request, env) {
+  const auth = await requireAdmin(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const keys = [];
+    let cursor;
+    do {
+      const listed = await env.KV_STORE.list({ prefix: 's3key:', cursor });
+      for (const key of listed.keys) {
+        const data = await env.KV_STORE.get(key.name);
+        if (data) {
+          const keyData = JSON.parse(data);
+          keys.push({
+            accessKeyId: keyData.accessKeyId,
+            name: keyData.name || '',
+            createdAt: keyData.createdAt,
+            status: keyData.status || 'active'
+          });
+        }
+      }
+      cursor = listed.list_complete ? null : listed.cursor;
+    } while (cursor);
+
+    return jsonResponse({ success: true, keys });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '获取密钥列表失败: ' + e.message }, 500);
+  }
+}
+
+async function handleCreateS3Key(request, env) {
+  const auth = await requireAdmin(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const body = await request.json();
+    const { name } = body;
+
+    const accessKeyId = 'AK' + generateId(18).toUpperCase();
+    const secretKey = generateId(40);
+
+    const keyData = {
+      accessKeyId, secretKey,
+      name: name || '',
+      createdAt: Date.now(),
+      status: 'active',
+      createdBy: auth.email || 'admin'
+    };
+
+    await env.KV_STORE.put(`s3key:${accessKeyId}`, JSON.stringify(keyData));
+
+    return jsonResponse({
+      success: true, accessKeyId, secretKey,
+      message: '密钥已创建，请妥善保管 Secret Key，它不会再次显示'
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '创建密钥失败: ' + e.message }, 500);
+  }
+}
+
+async function handleDeleteS3Key(request, env, accessKeyId) {
+  const auth = await requireAdmin(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    await env.KV_STORE.delete(`s3key:${accessKeyId}`);
+    return jsonResponse({ success: true, message: '密钥已删除' });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '删除密钥失败: ' + e.message }, 500);
+  }
+}
+
+async function handleToggleS3Key(request, env, accessKeyId) {
+  const auth = await requireAdmin(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const data = await env.KV_STORE.get(`s3key:${accessKeyId}`);
+    if (!data) return jsonResponse({ success: false, message: '密钥不存在' }, 404);
+
+    const keyData = JSON.parse(data);
+    keyData.status = keyData.status === 'active' ? 'disabled' : 'active';
+    await env.KV_STORE.put(`s3key:${accessKeyId}`, JSON.stringify(keyData));
+
+    return jsonResponse({ success: true, status: keyData.status });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '操作失败: ' + e.message }, 500);
+  }
+}
+
+// ============================================================================
+// WEBDAV HANDLERS
+// ============================================================================
+
+async function handleWebDavRequest(request, env, path) {
+  const method = request.method;
+
+  const auth = await verifyWebDavAuth(request, env);
+  if (!auth) {
+    return new Response('Unauthorized', {
+      status: 401,
+      headers: { 'WWW-Authenticate': 'Basic realm="EdgeStash WebDAV"' }
+    });
+  }
+
+  let resourcePath = path.replace(/^\/dav\/?/, '');
+  if (resourcePath.startsWith('/')) resourcePath = resourcePath.slice(1);
+
+  try {
+    switch (method) {
+      case 'OPTIONS': return webDavOptions();
+      case 'PROPFIND': return await webDavPropFind(request, env, resourcePath);
+      case 'GET': return await webDavGet(env, resourcePath);
+      case 'HEAD': return await webDavHead(env, resourcePath);
+      case 'PUT': return await webDavPut(request, env, resourcePath);
+      case 'DELETE': return await webDavDelete(env, resourcePath);
+      case 'MKCOL': return await webDavMkcol(env, resourcePath);
+      case 'COPY': return await webDavCopy(request, env, resourcePath);
+      case 'MOVE': return await webDavMove(request, env, resourcePath);
+      case 'LOCK': return await webDavLock(request, env, resourcePath);
+      case 'UNLOCK': return await webDavUnlock(request, env, resourcePath);
+      default: return webDavError(405, 'Method Not Allowed');
+    }
+  } catch (e) {
+    return webDavError(500, 'Internal Server Error: ' + e.message);
+  }
+}
+
+async function verifyWebDavAuth(request, env) {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Basic ')) return null;
+
+  try {
+    const decoded = atob(authHeader.slice(6));
+    const [email, password] = decoded.split(':', 2);
+    if (!email || !password) return null;
+
+    if (password === env.ADMIN_PASSWORD && !email.includes('@')) {
+      return { role: 'admin', email: 'admin' };
+    }
+
+    const userData = await env.KV_STORE.get(`user:${email}`);
+    if (!userData) return null;
+
+    const user = JSON.parse(userData);
+    const passwordHash = await hashPassword(password);
+    if (user.passwordHash !== passwordHash) return null;
+
+    return { role: user.role || 'user', email: user.email };
+  } catch (e) {
+    return null;
+  }
+}
+
+function webDavOptions() {
+  return new Response(null, {
+    status: 200,
+    headers: {
+      'Allow': 'OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, COPY, MOVE, LOCK, UNLOCK',
+      'DAV': '1, 2',
+      'MS-Author-Via': 'DAV',
+      'Content-Length': '0'
+    }
+  });
+}
+
+async function webDavPropFind(request, env, resourcePath) {
+  const depth = request.headers.get('Depth') || 'infinity';
+
+  let prefix = resourcePath;
+  if (prefix && !prefix.endsWith('/')) prefix += '/';
+  if (prefix.startsWith('/')) prefix = prefix.slice(1);
+
+  // Check if it's a file
+  if (resourcePath && !resourcePath.endsWith('/')) {
+    const key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
+    const headObj = await env.R2_BUCKET.head(key);
+    if (headObj) {
+      const href = '/dav/' + key;
+      const response = webDavPropResponse(href, null, headObj.size, headObj.uploaded,
+        headObj.httpMetadata?.contentType || getMimeType(key.split('/').pop()), false);
+      return new Response(webDavMultistatus(response), {
+        status: 207,
+        headers: { 'Content-Type': 'application/xml; charset=utf-8' }
+      });
+    }
+  }
+
+  // Directory listing
+  const listed = await env.R2_BUCKET.list({ prefix, delimiter: '/' });
+  const responses = [];
+  const basePath = '/dav/' + (resourcePath ? resourcePath.replace(/\/$/, '') : '');
+
+  responses.push(webDavPropResponse(basePath + '/', null, 0, null, null, true));
+
+  if (listed.delimitedPrefixes) {
+    for (const folderPrefix of listed.delimitedPrefixes) {
+      const folderName = folderPrefix.slice(prefix.length).replace(/\/$/, '');
+      if (folderName && folderName !== '.folder') {
+        responses.push(webDavPropResponse('/dav/' + folderPrefix.slice(0, -1), null, 0, null, null, true));
+      }
+    }
+  }
+
+  if (listed.objects) {
+    for (const obj of listed.objects) {
+      const name = obj.key.slice(prefix.length);
+      if (name && !name.includes('/') && name !== '.folder') {
+        responses.push(webDavPropResponse('/dav/' + obj.key, null, obj.size, obj.uploaded,
+          obj.httpMetadata?.contentType || getMimeType(name), false));
+      }
+    }
+  }
+
+  return new Response(webDavMultistatus(responses.join('\n')), {
+    status: 207,
+    headers: { 'Content-Type': 'application/xml; charset=utf-8' }
+  });
+}
+
+async function webDavGet(env, resourcePath) {
+  const key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
+  if (!key) return webDavError(400, 'No resource specified');
+
+  const object = await env.R2_BUCKET.get(key);
+  if (!object) return webDavError(404, 'Not Found');
+
+  return new Response(object.body, {
+    status: 200,
+    headers: {
+      'Content-Type': object.httpMetadata?.contentType || getMimeType(key.split('/').pop()),
+      'Content-Length': object.size,
+      'Last-Modified': (object.uploaded || new Date()).toUTCString(),
+      'ETag': `"${generateId(8)}"`
+    }
+  });
+}
+
+async function webDavHead(env, resourcePath) {
+  const key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
+  if (!key) return webDavError(400, 'No resource specified');
+
+  const object = await env.R2_BUCKET.head(key);
+  if (!object) return webDavError(404, 'Not Found');
+
+  return new Response(null, {
+    status: 200,
+    headers: {
+      'Content-Type': object.httpMetadata?.contentType || getMimeType(key.split('/').pop()),
+      'Content-Length': object.size,
+      'Last-Modified': (object.uploaded || new Date()).toUTCString(),
+      'ETag': `"${generateId(8)}"`
+    }
+  });
+}
+
+async function webDavPut(request, env, resourcePath) {
+  const key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
+  if (!key) return webDavError(400, 'No resource specified');
+
+  const contentType = request.headers.get('Content-Type') || getMimeType(key.split('/').pop());
+  await env.R2_BUCKET.put(key, request.body, { httpMetadata: { contentType } });
+
+  const parts = key.split('/');
+  if (parts.length > 1) {
+    try { await env.R2_BUCKET.delete(parts.slice(0, -1).join('/') + '/.folder'); } catch (e) { /* ignore */ }
+  }
+
+  return new Response(null, { status: 201 });
+}
+
+async function webDavDelete(env, resourcePath) {
+  let key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
+  if (!key) return webDavError(400, 'No resource specified');
+
+  const listed = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
+  if (listed.objects && listed.objects.length > 0) {
+    let cursor;
+    do {
+      const batch = await env.R2_BUCKET.list({ prefix: key + '/', cursor });
+      if (batch.objects && batch.objects.length > 0) {
+        await env.R2_BUCKET.delete(batch.objects.map(obj => obj.key));
+      }
+      cursor = batch.truncated ? batch.cursor : null;
+    } while (cursor);
+  }
+
+  await env.R2_BUCKET.delete(key);
+  try { await env.R2_BUCKET.delete(key + '/.folder'); } catch (e) { /* ignore */ }
+
+  return new Response(null, { status: 204 });
+}
+
+async function webDavMkcol(env, resourcePath) {
+  let key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
+  if (!key) return webDavError(400, 'No resource specified');
+  if (!key.endsWith('/')) key += '/';
+
+  const listed = await env.R2_BUCKET.list({ prefix: key, limit: 1 });
+  if ((listed.objects && listed.objects.length > 0) ||
+      (listed.delimitedPrefixes && listed.delimitedPrefixes.length > 0)) {
+    return new Response(null, { status: 405 });
+  }
+
+  await env.R2_BUCKET.put(key + '.folder', new Uint8Array(0));
+  return new Response(null, { status: 201 });
+}
+
+async function webDavCopy(request, env, resourcePath) {
+  const destination = request.headers.get('Destination');
+  if (!destination) return webDavError(400, 'Missing Destination header');
+
+  const srcKey = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
+  let destPath;
+  try { destPath = new URL(destination).pathname.replace(/^\/dav\/?/, ''); }
+  catch (e) { destPath = destination.replace(/^\/dav\/?/, ''); }
+  const destKey = destPath.startsWith('/') ? destPath.slice(1) : destPath;
+
+  const srcObject = await env.R2_BUCKET.get(srcKey);
+  if (srcObject) {
+    await env.R2_BUCKET.put(destKey, srcObject.body, { httpMetadata: srcObject.httpMetadata });
+    return new Response(null, { status: 201 });
+  }
+
+  const listed = await env.R2_BUCKET.list({ prefix: srcKey + '/' });
+  if (listed.objects && listed.objects.length > 0) {
+    for (const obj of listed.objects) {
+      const relativePath = obj.key.slice(srcKey.length);
+      const newKey = destKey + '/' + relativePath;
+      const objData = await env.R2_BUCKET.get(obj.key);
+      if (objData) {
+        await env.R2_BUCKET.put(newKey, objData.body, { httpMetadata: objData.httpMetadata });
+      }
+    }
+    return new Response(null, { status: 207 });
+  }
+
+  return webDavError(404, 'Source not found');
+}
+
+async function webDavMove(request, env, resourcePath) {
+  const destination = request.headers.get('Destination');
+  if (!destination) return webDavError(400, 'Missing Destination header');
+
+  const srcKey = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
+  let destPath;
+  try { destPath = new URL(destination).pathname.replace(/^\/dav\/?/, ''); }
+  catch (e) { destPath = destination.replace(/^\/dav\/?/, ''); }
+  const destKey = destPath.startsWith('/') ? destPath.slice(1) : destPath;
+
+  const srcObject = await env.R2_BUCKET.get(srcKey);
+  if (srcObject) {
+    await env.R2_BUCKET.put(destKey, srcObject.body, { httpMetadata: srcObject.httpMetadata });
+    await env.R2_BUCKET.delete(srcKey);
+    return new Response(null, { status: 201 });
+  }
+
+  const listed = await env.R2_BUCKET.list({ prefix: srcKey + '/' });
+  if (listed.objects && listed.objects.length > 0) {
+    for (const obj of listed.objects) {
+      const relativePath = obj.key.slice(srcKey.length);
+      const newKey = destKey + '/' + relativePath;
+      const objData = await env.R2_BUCKET.get(obj.key);
+      if (objData) {
+        await env.R2_BUCKET.put(newKey, objData.body, { httpMetadata: objData.httpMetadata });
+      }
+      await env.R2_BUCKET.delete(obj.key);
+    }
+    try { await env.R2_BUCKET.delete(srcKey + '/.folder'); } catch (e) { /* ignore */ }
+    return new Response(null, { status: 201 });
+  }
+
+  return webDavError(404, 'Source not found');
+}
+
+async function webDavLock(request, env, resourcePath) {
+  const key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
+  const lockToken = 'urn:uuid:' + generateId(8) + '-' + generateId(4) + '-' + generateId(4) + '-' + generateId(4) + '-' + generateId(12);
+
+  await env.KV_STORE.put(`lock:${key}`, JSON.stringify({
+    token: lockToken,
+    owner: request.headers.get('Timeout') || 'infinite',
+    created: Date.now()
+  }), { expirationTtl: 3600 });
+
+  const xml = `<?xml version="1.0" encoding="utf-8"?>
+<D:prop xmlns:D="DAV:">
+  <D:lockdiscovery>
+    <D:activelock>
+      <D:locktype><D:write/></D:locktype>
+      <D:lockscope><D:exclusive/></D:lockscope>
+      <D:depth>0</D:depth>
+      <D:timeout>Second-3600</D:timeout>
+      <D:locktoken>
+        <D:href>${escapeXml(lockToken)}</D:href>
+      </D:locktoken>
+    </D:activelock>
+  </D:lockdiscovery>
+</D:prop>`;
+
+  return new Response(xml, {
+    status: 200,
+    headers: { 'Content-Type': 'application/xml; charset=utf-8', 'Lock-Token': `<${lockToken}>` }
+  });
+}
+
+async function webDavUnlock(request, env, resourcePath) {
+  const key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
+  await env.KV_STORE.delete(`lock:${key}`);
+  return new Response(null, { status: 204 });
 }
 
 // ============================================================================
@@ -2518,6 +3616,7 @@ const ADMIN_PAGE = `
       <button class="tab active" onclick="switchTab('stats')">统计数据</button>
       <button class="tab" onclick="switchTab('shares')">分享链接</button>
       <button class="tab" onclick="switchTab('users')">授权用户</button>
+      <button class="tab" onclick="switchTab('s3keys')">S3/WebDAV</button>
     </div>
     
     <!-- Stats Tab -->
@@ -2585,8 +3684,66 @@ const ADMIN_PAGE = `
         </div>
       </div>
     </div>
+
+    <!-- S3/WebDAV Tab -->
+    <div id="s3keysTab" class="tab-content">
+      <div class="card" style="margin-bottom: 24px;">
+        <div class="card-header">
+          <div class="card-title">🔌 协议接入点</div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+          <div style="background: var(--background); border-radius: 12px; padding: 20px;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+              <span style="font-weight: 600; font-size: 16px;">🪣 S3 兼容 API</span>
+              <span class="badge badge-success">已启用</span>
+            </div>
+            <div style="color: var(--text-muted); font-size: 13px; margin-bottom: 8px;">Endpoint:</div>
+            <code style="background: var(--surface-light); padding: 6px 10px; border-radius: 6px; display: block; word-break: break-all; font-size: 13px;" id="s3Endpoint"></code>
+            <div style="color: var(--text-muted); font-size: 12px; margin-top: 8px;">兼容 aws cli / rclone / Cyberduck 等 S3 客户端</div>
+          </div>
+          <div style="background: var(--background); border-radius: 12px; padding: 20px;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+              <span style="font-weight: 600; font-size: 16px;">📂 WebDAV</span>
+              <span class="badge badge-success">已启用</span>
+            </div>
+            <div style="color: var(--text-muted); font-size: 13px; margin-bottom: 8px;">Endpoint:</div>
+            <code style="background: var(--surface-light); padding: 6px 10px; border-radius: 6px; display: block; word-break: break-all; font-size: 13px;" id="webdavEndpoint"></code>
+            <div style="color: var(--text-muted); font-size: 12px; margin-top: 8px;">可用 Finder / Windows 资源管理器 / 各类文件管理器挂载</div>
+          </div>
+        </div>
+        <div style="margin-top: 16px; background: var(--background); border-radius: 12px; padding: 16px;">
+          <div style="font-weight: 500; margin-bottom: 8px;">📖 快速连接指南</div>
+          <div style="font-size: 13px; color: var(--text-muted); line-height: 1.8;">
+            <div><strong>aws cli:</strong> <code>aws --endpoint-url &lt;S3_ENDPOINT&gt; s3 ls</code></div>
+            <div><strong>rclone:</strong> 配置 type=s3, provider=Other, endpoint=&lt;S3_ENDPOINT&gt;</div>
+            <div><strong>macOS Finder:</strong> 前往 → 连接服务器 → 输入 WebDAV 地址</div>
+            <div><strong>Windows:</strong> 映射网络驱动器 → 输入 WebDAV 地址</div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🔑 S3 Access Keys</div>
+          <button class="btn btn-primary" onclick="showCreateS3KeyModal()">创建新密钥</button>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>Access Key ID</th>
+                <th>状态</th>
+                <th>创建时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="s3KeysTable"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   </div>
-  
+
   <!-- Add User Modal -->
   <div class="modal-overlay" id="addUserModal">
     <div class="modal">
@@ -2607,7 +3764,54 @@ const ADMIN_PAGE = `
       </form>
     </div>
   </div>
-  
+
+  <!-- Create S3 Key Modal -->
+  <div class="modal-overlay" id="createS3KeyModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">创建 S3 密钥</div>
+        <button class="modal-close" onclick="closeModal('createS3KeyModal')">&times;</button>
+      </div>
+      <form onsubmit="createS3Key(event)">
+        <div class="form-group">
+          <label class="form-label">密钥名称（可选）</label>
+          <input type="text" id="s3KeyName" class="form-input" placeholder="例如: rclone、my-laptop">
+        </div>
+        <button type="submit" class="btn btn-primary" style="width: 100%;">创建</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- S3 Key Result Modal -->
+  <div class="modal-overlay" id="s3KeyResultModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div class="modal-title">✅ 密钥已创建</div>
+        <button class="modal-close" onclick="closeModal('s3KeyResultModal')">&times;</button>
+      </div>
+      <div style="background: var(--background); border-radius: 12px; padding: 20px; margin-bottom: 16px;">
+        <div style="color: var(--warning); font-size: 14px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+          ⚠️ 请立即保存 Secret Key，关闭后将无法再次查看！
+        </div>
+        <div class="form-group">
+          <label class="form-label">Access Key ID</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="resultAccessKeyId" class="form-input" readonly>
+            <button class="btn btn-secondary btn-sm" onclick="copyToClipboard('resultAccessKeyId')">复制</button>
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom: 0;">
+          <label class="form-label">Secret Key</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="resultSecretKey" class="form-input" readonly>
+            <button class="btn btn-secondary btn-sm" onclick="copyToClipboard('resultSecretKey')">复制</button>
+          </div>
+        </div>
+      </div>
+      <button class="btn btn-primary" style="width: 100%;" onclick="closeModal('s3KeyResultModal')">我已保存，关闭</button>
+    </div>
+  </div>
+
   <div class="toast-container" id="toastContainer"></div>
   
   <div class="loading-overlay" id="loadingOverlay" style="display: none;">
@@ -2637,6 +3841,7 @@ const ADMIN_PAGE = `
       if (tab === 'stats') loadStats();
       else if (tab === 'shares') loadShares();
       else if (tab === 'users') loadUsers();
+      else if (tab === 's3keys') { loadS3Keys(); initS3WebDavTab(); }
     }
     
     async function loadStats() {
@@ -2855,7 +4060,117 @@ const ADMIN_PAGE = `
       div.textContent = text;
       return div.innerHTML;
     }
-    
+
+    // S3/WebDAV management functions
+    async function loadS3Keys() {
+      showLoading(true);
+      try {
+        const response = await fetch('/api/admin/s3keys');
+        const data = await response.json();
+        if (data.success) {
+          const tbody = document.getElementById('s3KeysTable');
+          if (data.keys.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-muted);">暂无密钥，点击"创建新密钥"开始</td></tr>';
+            return;
+          }
+          tbody.innerHTML = data.keys.map(key => \`
+            <tr>
+              <td>\${escapeHtml(key.name || '-')}</td>
+              <td><code style="font-size: 12px;">\${key.accessKeyId}</code></td>
+              <td>
+                \${key.status === 'active'
+                  ? '<span class="badge badge-success">启用</span>'
+                  : '<span class="badge badge-error">禁用</span>'}
+              </td>
+              <td>\${key.createdAt ? new Date(key.createdAt).toLocaleString() : '-'}</td>
+              <td>
+                <button class="btn btn-sm btn-secondary" onclick="toggleS3Key('\${key.accessKeyId}')">
+                  \${key.status === 'active' ? '禁用' : '启用'}
+                </button>
+                <button class="btn btn-sm btn-danger" onclick="deleteS3Key('\${key.accessKeyId}')">删除</button>
+              </td>
+            </tr>
+          \`).join('');
+        }
+      } catch (error) {
+        showToast('加载密钥列表失败', 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    function showCreateS3KeyModal() {
+      document.getElementById('s3KeyName').value = '';
+      document.getElementById('createS3KeyModal').classList.add('active');
+    }
+
+    async function createS3Key(event) {
+      event.preventDefault();
+      const name = document.getElementById('s3KeyName').value;
+      showLoading(true);
+      closeModal('createS3KeyModal');
+      try {
+        const response = await fetch('/api/admin/s3keys', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        });
+        const data = await response.json();
+        if (data.success) {
+          document.getElementById('resultAccessKeyId').value = data.accessKeyId;
+          document.getElementById('resultSecretKey').value = data.secretKey;
+          document.getElementById('s3KeyResultModal').classList.add('active');
+          loadS3Keys();
+        } else {
+          showToast('创建失败: ' + data.message, 'error');
+        }
+      } catch (error) {
+        showToast('创建失败: ' + error.message, 'error');
+      } finally {
+        showLoading(false);
+      }
+    }
+
+    async function deleteS3Key(accessKeyId) {
+      if (!confirm('确定要删除此密钥吗？使用该密钥的客户端将立即失去访问权限。')) return;
+      showLoading(true);
+      try {
+        const response = await fetch('/api/admin/s3keys/' + accessKeyId, { method: 'DELETE' });
+        const data = await response.json();
+        if (data.success) { showToast('密钥已删除', 'success'); loadS3Keys(); }
+        else { showToast('删除失败: ' + data.message, 'error'); }
+      } catch (error) { showToast('删除失败: ' + error.message, 'error'); }
+      finally { showLoading(false); }
+    }
+
+    async function toggleS3Key(accessKeyId) {
+      showLoading(true);
+      try {
+        const response = await fetch('/api/admin/s3keys/' + accessKeyId + '/toggle', { method: 'POST' });
+        const data = await response.json();
+        if (data.success) { showToast('状态已更新', 'success'); loadS3Keys(); }
+        else { showToast('操作失败: ' + data.message, 'error'); }
+      } catch (error) { showToast('操作失败: ' + error.message, 'error'); }
+      finally { showLoading(false); }
+    }
+
+    function copyToClipboard(inputId) {
+      const input = document.getElementById(inputId);
+      navigator.clipboard.writeText(input.value).then(() => {
+        showToast('已复制', 'success');
+      }).catch(() => {
+        input.select();
+        document.execCommand('copy');
+        showToast('已复制', 'success');
+      });
+    }
+
+    function initS3WebDavTab() {
+      const endpoint = window.location.origin;
+      document.getElementById('s3Endpoint').textContent = endpoint;
+      document.getElementById('webdavEndpoint').textContent = endpoint + '/dav/';
+    }
+
     // Initialize
     checkAdminAuth();
     loadStats();
@@ -3040,6 +4355,18 @@ export default {
     }
     
     try {
+      // S3 API request detection (by Authorization header)
+      const authHeader = request.headers.get('Authorization');
+      if (authHeader && authHeader.startsWith('AWS4-HMAC-SHA256 ')) {
+        const s3Response = await handleS3Request(request, env);
+        if (s3Response) return s3Response;
+      }
+
+      // WebDAV routes (/dav/*)
+      if (path.startsWith('/dav')) {
+        return await handleWebDavRequest(request, env, path);
+      }
+
       // API Routes
       if (path.startsWith('/api/')) {
         // Auth routes
@@ -3131,7 +4458,26 @@ export default {
           const email = path.split('/').pop();
           return await handleDeleteUser(request, env, email);
         }
-        
+
+        // S3 Key management routes
+        if (path === '/api/admin/s3keys' && method === 'GET') {
+          return await handleListS3Keys(request, env);
+        }
+
+        if (path === '/api/admin/s3keys' && method === 'POST') {
+          return await handleCreateS3Key(request, env);
+        }
+
+        if (path.match(/^\/api\/admin\/s3keys\/[^/]+\/toggle$/) && method === 'POST') {
+          const accessKeyId = path.split('/')[4];
+          return await handleToggleS3Key(request, env, accessKeyId);
+        }
+
+        if (path.match(/^\/api\/admin\/s3keys\/[^/]+$/) && method === 'DELETE') {
+          const accessKeyId = path.split('/').pop();
+          return await handleDeleteS3Key(request, env, accessKeyId);
+        }
+
         return jsonResponse({ success: false, message: 'API 路径不存在' }, 404);
       }
       
