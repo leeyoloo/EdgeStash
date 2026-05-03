@@ -685,8 +685,20 @@ async function handleListFiles(request, env, path) {
     let prefix = path || '';
     if (prefix && !prefix.endsWith('/')) prefix += '/';
     if (prefix.startsWith('/')) prefix = prefix.slice(1);
-    
-    const listed = await env.R2_BUCKET.list({ prefix, delimiter: '/' });
+
+    let listed = await env.R2_BUCKET.list({ prefix, delimiter: '/' });
+
+    // Fallback: if nothing found, try encoded prefix (for folders created by WebDAV clients)
+    if (prefix && listed.objects.length === 0 && listed.delimitedPrefixes.length === 0) {
+      const encodedPrefix = encodePathSegments(prefix);
+      if (encodedPrefix !== prefix) {
+        const encodedListed = await env.R2_BUCKET.list({ prefix: encodedPrefix, delimiter: '/' });
+        if (encodedListed.objects.length > 0 || encodedListed.delimitedPrefixes.length > 0) {
+          listed = encodedListed;
+          prefix = encodedPrefix;
+        }
+      }
+    }
     
     const files = [];
     const folders = [];
@@ -918,14 +930,23 @@ async function handleListFolders(request, env, path) {
     folders.push({ name: '根目录', path: '/' });
 
     // List all folders recursively by scanning delimitedPrefixes
+    const seenPaths = new Set(['/']);
     const listAll = async (p) => {
       const listed = await env.R2_BUCKET.list({ prefix: p, delimiter: '/' });
-      if (listed.delimitedPrefixes) {
-        for (const fp of listed.delimitedPrefixes) {
-          const name = fp.slice(p.length).replace(/\/$/, '');
-          if (name && name !== '.folder') {
-            const fullPath = '/' + fp.slice(0, -1);
-            folders.push({ name: decodePathSegments(name), path: fullPath });
+      // Also try encoded prefix to catch folders created by WebDAV clients
+      const encodedP = encodePathSegments(p);
+      let allPrefixes = listed.delimitedPrefixes || [];
+      if (encodedP !== p) {
+        const encodedListed = await env.R2_BUCKET.list({ prefix: encodedP, delimiter: '/' });
+        allPrefixes = [...allPrefixes, ...(encodedListed.delimitedPrefixes || [])];
+      }
+      for (const fp of allPrefixes) {
+        const name = fp.slice(p.length).replace(/\/$/, '');
+        if (name && name !== '.folder') {
+          const decodedPath = '/' + decodePathSegments(fp).replace(/\/$/, '');
+          if (!seenPaths.has(decodedPath)) {
+            seenPaths.add(decodedPath);
+            folders.push({ name: decodePathSegments(name), path: decodedPath });
             await listAll(fp); // recurse into subfolders
           }
         }
@@ -2311,7 +2332,19 @@ async function webDavPropFind(request, env, resourcePath) {
   }
 
   // Directory listing
-  const listed = await env.R2_BUCKET.list({ prefix, delimiter: '/' });
+  let listed = await env.R2_BUCKET.list({ prefix, delimiter: '/' });
+
+  // Fallback: try encoded prefix if nothing found
+  if (prefix && listed.objects.length === 0 && listed.delimitedPrefixes.length === 0) {
+    const encodedPrefix = encodePathSegments(prefix);
+    if (encodedPrefix !== prefix) {
+      const encodedListed = await env.R2_BUCKET.list({ prefix: encodedPrefix, delimiter: '/' });
+      if (encodedListed.objects.length > 0 || encodedListed.delimitedPrefixes.length > 0) {
+        listed = encodedListed;
+      }
+    }
+  }
+
   const responses = [];
   const basePath = '/dav/' + (resourcePath ? resourcePath.replace(/\/$/, '') : '');
 
