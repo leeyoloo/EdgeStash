@@ -258,6 +258,44 @@ function htmlResponse(html, status = 200, headers = {}) {
 // ============================================================================
 
 /**
+ * Decode URL-encoded path segments (e.g. from WebDAV clients like MT Manager)
+ * Handles each segment separately to preserve '/' delimiters.
+ */
+function decodePathSegments(path) {
+  return path.split('/').map(segment => {
+    try { return decodeURIComponent(segment); }
+    catch (e) { return segment; }
+  }).join('/');
+}
+
+/**
+ * Encode path segments (opposite of decodePathSegments).
+ */
+function encodePathSegments(path) {
+  return path.split('/').map(encodeURIComponent).join('/');
+}
+
+/**
+ * Look up an R2 object, trying decoded key first then falling back to encoded key.
+ * This handles backward compatibility with files stored using URL-encoded names.
+ */
+async function r2HeadWithFallback(env, key) {
+  let obj = await env.R2_BUCKET.head(key);
+  if (!obj && key !== encodePathSegments(key)) {
+    obj = await env.R2_BUCKET.head(encodePathSegments(key));
+  }
+  return obj;
+}
+
+async function r2GetWithFallback(env, key, options) {
+  let obj = await env.R2_BUCKET.get(key, options);
+  if (!obj && key !== encodePathSegments(key)) {
+    obj = await env.R2_BUCKET.get(encodePathSegments(key), options);
+  }
+  return obj;
+}
+
+/**
  * Convert ArrayBuffer to hex string
  */
 function bufferToHex(buffer) {
@@ -621,22 +659,24 @@ async function handleListFiles(request, env, path) {
     // Process folders (common prefixes)
     if (listed.delimitedPrefixes) {
       for (const folderPath of listed.delimitedPrefixes) {
-        const name = folderPath.slice(prefix.length, -1);
-        if (name) {
-          folders.push({ name, path: '/' + folderPath.slice(0, -1) });
+        const rawName = folderPath.slice(prefix.length, -1);
+        if (rawName) {
+          const name = decodePathSegments(rawName);
+          folders.push({ name, path: '/' + decodePathSegments(folderPath.slice(0, -1)) });
         }
       }
     }
-    
+
     // Process files
     if (listed.objects) {
       for (const obj of listed.objects) {
-        const name = obj.key.slice(prefix.length);
-        if (name && !name.includes('/')) {
+        const rawName = obj.key.slice(prefix.length);
+        if (rawName && !rawName.includes('/')) {
+          const name = decodePathSegments(rawName);
           const previewType = getPreviewType(name);
           files.push({
             name,
-            path: '/' + obj.key,
+            path: '/' + decodePathSegments(obj.key),
             size: obj.size,
             sizeFormatted: formatFileSize(obj.size),
             lastModified: obj.uploaded.toISOString(),
@@ -704,9 +744,14 @@ async function handleDeleteFile(request, env, path) {
       } while (cursor);
     }
     
-    // Try to delete the file itself
+    // Try to delete the file itself (try encoded key fallback for backward compatibility)
+    const encodedKey = encodePathSegments(key);
+    if (key !== encodedKey) {
+      const encodedExists = await env.R2_BUCKET.head(encodedKey);
+      if (encodedExists) key = encodedKey;
+    }
     await env.R2_BUCKET.delete(key);
-    
+
     return jsonResponse({ success: true, message: '删除成功' });
   } catch (e) {
     return jsonResponse({ success: false, message: '删除失败: ' + e.message }, 500);
@@ -727,10 +772,17 @@ async function handleRenameFile(request, env, path) {
     
     let oldKey = path || '';
     if (oldKey.startsWith('/')) oldKey = oldKey.slice(1);
-    
+
+    // Try encoded key fallback for backward compatibility
+    const encodedOldKey = encodePathSegments(oldKey);
+    if (oldKey !== encodedOldKey) {
+      const encodedExists = await env.R2_BUCKET.head(encodedOldKey);
+      if (encodedExists) oldKey = encodedOldKey;
+    }
+
     const parentPath = oldKey.includes('/') ? oldKey.substring(0, oldKey.lastIndexOf('/') + 1) : '';
     const newKey = parentPath + newName;
-    
+
     // Get the old file
     const oldObject = await env.R2_BUCKET.get(oldKey);
     if (!oldObject) {
@@ -2039,6 +2091,8 @@ async function handleWebDavRequest(request, env, path) {
 
   let resourcePath = path.replace(/^\/dav\/?/, '');
   if (resourcePath.startsWith('/')) resourcePath = resourcePath.slice(1);
+  // Decode URL-encoded path segments (MT Manager and some WebDAV clients percent-encode CJK characters)
+  resourcePath = decodePathSegments(resourcePath);
 
   try {
     switch (method) {
@@ -2108,9 +2162,9 @@ async function webDavPropFind(request, env, resourcePath) {
   // Check if it's a file
   if (resourcePath && !resourcePath.endsWith('/')) {
     const key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
-    const headObj = await env.R2_BUCKET.head(key);
+    const headObj = await r2HeadWithFallback(env, key);
     if (headObj) {
-      const href = '/dav/' + key;
+      const href = '/dav/' + decodePathSegments(key);
       const response = webDavPropResponse(href, null, headObj.size, headObj.uploaded,
         headObj.httpMetadata?.contentType || getMimeType(key.split('/').pop()), false);
       return new Response(webDavMultistatus(response), {
@@ -2131,7 +2185,7 @@ async function webDavPropFind(request, env, resourcePath) {
     for (const folderPrefix of listed.delimitedPrefixes) {
       const folderName = folderPrefix.slice(prefix.length).replace(/\/$/, '');
       if (folderName && folderName !== '.folder') {
-        responses.push(webDavPropResponse('/dav/' + folderPrefix.slice(0, -1), null, 0, null, null, true));
+        responses.push(webDavPropResponse('/dav/' + decodePathSegments(folderPrefix.slice(0, -1)), null, 0, null, null, true));
       }
     }
   }
@@ -2140,7 +2194,8 @@ async function webDavPropFind(request, env, resourcePath) {
     for (const obj of listed.objects) {
       const name = obj.key.slice(prefix.length);
       if (name && !name.includes('/') && name !== '.folder') {
-        responses.push(webDavPropResponse('/dav/' + obj.key, null, obj.size, obj.uploaded,
+        const decodedKey = decodePathSegments(obj.key);
+        responses.push(webDavPropResponse('/dav/' + decodedKey, null, obj.size, obj.uploaded,
           obj.httpMetadata?.contentType || getMimeType(name), false));
       }
     }
@@ -2167,7 +2222,7 @@ async function webDavGet(request, env, resourcePath) {
     }
   }
 
-  const object = await env.R2_BUCKET.get(key, options);
+  const object = await r2GetWithFallback(env, key, options);
   if (!object) return webDavError(404, 'Not Found');
 
   const responseHeaders = {
@@ -2193,7 +2248,7 @@ async function webDavHead(env, resourcePath) {
   const key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
   if (!key) return webDavError(400, 'No resource specified');
 
-  const object = await env.R2_BUCKET.head(key);
+  const object = await r2HeadWithFallback(env, key);
   if (!object) return webDavError(404, 'Not Found');
 
   return new Response(null, {
@@ -2226,6 +2281,16 @@ async function webDavPut(request, env, resourcePath) {
 async function webDavDelete(env, resourcePath) {
   let key = resourcePath.startsWith('/') ? resourcePath.slice(1) : resourcePath;
   if (!key) return webDavError(400, 'No resource specified');
+
+  // Try encoded key as fallback for backward compatibility
+  const encodedKey = encodePathSegments(key);
+  if (key === encodedKey) {
+    // key is already encoded (no CJK chars), use as-is
+  } else {
+    // Check if the encoded version exists (old file)
+    const encodedExists = await env.R2_BUCKET.head(encodedKey);
+    if (encodedExists) key = encodedKey;
+  }
 
   const listed = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
   if (listed.objects && listed.objects.length > 0) {
@@ -2268,6 +2333,7 @@ async function webDavCopy(request, env, resourcePath) {
   let destPath;
   try { destPath = new URL(destination).pathname.replace(/^\/dav\/?/, ''); }
   catch (e) { destPath = destination.replace(/^\/dav\/?/, ''); }
+  destPath = decodePathSegments(destPath);
   const destKey = destPath.startsWith('/') ? destPath.slice(1) : destPath;
 
   const srcObject = await env.R2_BUCKET.get(srcKey);
@@ -2303,6 +2369,7 @@ async function webDavMove(request, env, resourcePath) {
   let destPath;
   try { destPath = new URL(destination).pathname.replace(/^\/dav\/?/, ''); }
   catch (e) { destPath = destination.replace(/^\/dav\/?/, ''); }
+  destPath = decodePathSegments(destPath);
   const destKey = destPath.startsWith('/') ? destPath.slice(1) : destPath;
 
   // If overwrite is 'F' (false), check if destination exists
