@@ -5,7 +5,7 @@
 
 EdgeStash**支持带密码分享文件、在线预览docx或pdf文档、后台管理授权用户、查看分享文件浏览/下载量！**
 
-这个项目旨在提供一个“一键部署”的体验，您只需要一个 Cloudflare 账户，即可在几分钟内拥有属于自己团队的云盘服务。
+这个项目旨在提供一个"一键部署"的体验，您只需要一个 Cloudflare 账户，即可在几分钟内拥有属于自己团队的云盘服务。
 
 ## 🛸 预览
 
@@ -44,10 +44,24 @@ https://www.bilibili.com/video/BV1s2FPzqEdA/
   - 拖拽式文件上传和多文件上传。
   - 面包屑导航，轻松在不同层级目录间穿梭。
 
+- **🪣 S3 兼容 API**：
+  - 通过 AWS Signature V4 认证，兼容 `aws cli`、`rclone`、Cyberduck 等 S3 客户端。
+  - 支持完整的文件操作：上传、下载、删除、复制、列举。
+  - 支持 Multipart Upload（分块上传），可传输大文件。
+  - 支持 Range 请求（断点续传）。
+  - 通过管理后台生成和管理 Access Key / Secret Key。
+
+- **📂 WebDAV 服务端**：
+  - 对外暴露标准 WebDAV 协议（`/dav/*` 路径）。
+  - 支持 macOS Finder、Windows 资源管理器、iOS 文件、Solid Explorer 等客户端直接挂载。
+  - 支持 PROPFIND、GET、PUT、DELETE、MKCOL、COPY、MOVE、LOCK 等方法。
+  - 使用 Basic Auth 认证，复用现有用户系统。
+
 - **🔧管理后台**：
   - **数据统计**：实时查看总分享数、总浏览量和总下载量。
   - **用户管理**：轻松添加新用户、撤销现有用户授权。
   - **分享管理**：集中查看和删除所有已创建的分享链接。
+  - **S3/WebDAV 管理**：创建和管理 S3 Access Key，查看接入点信息。
 
 - **💡现代化界面**：
   - 紫蓝色系渐变配色，美观、专业。
@@ -111,6 +125,106 @@ https://www.bilibili.com/video/BV1s2FPzqEdA/
 ### 😤已知的小bug
 管理员登录时如果点击`登录`按钮无反应，切换到`用户登录`，把`用户登录`的`邮箱`**输入框内容清空**，然后重新进行管理员登录即可~
 
+## 🔌 S3 / WebDAV 接入指南
+
+### S3 兼容 API
+
+在管理后台的「S3/WebDAV」标签页创建 Access Key 后，可使用任何 S3 兼容客户端连接。
+
+**Endpoint**: `https://<your-worker>.workers.dev`
+
+#### aws cli
+
+```bash
+# 配置凭证
+aws configure
+# 输入 Access Key ID 和 Secret Key
+# Region 输入任意值（如 us-east-1）
+
+# 列出存储桶（即根目录下的文件夹）
+aws --endpoint-url https://your-worker.workers.dev s3 ls
+
+# 上传文件
+aws --endpoint-url https://your-worker.workers.dev s3 cp ./myfile.txt s3://mybucket/
+
+# 下载文件
+aws --endpoint-url https://your-worker.workers.dev s3 cp s3://mybucket/myfile.txt ./
+
+# 列出桶内文件
+aws --endpoint-url https://your-worker.workers.dev s3 ls s3://mybucket/
+```
+
+#### rclone
+
+```bash
+# 交互式配置
+rclone config
+# 选择: New remote → 输入名称 → type=s3 → provider=Other
+# endpoint=https://your-worker.workers.dev
+# access_key_id=你的AccessKey
+# secret_access_key=你的SecretKey
+
+# 使用
+rclone ls myremote:/mybucket/
+rclone copy ./myfile.txt myremote:/mybucket/
+```
+
+#### macOS Finder
+
+前往 → 连接服务器 → 输入 `https://your-worker.workers.dev/dav/`
+
+#### Windows
+
+映射网络驱动器 → 输入 `https://your-worker.workers.dev/dav/`
+
+### WebDAV
+
+Endpoint: `https://<your-worker>.workers.dev/dav/`
+
+认证方式：使用 EdgeStash 的用户邮箱和密码（Basic Auth）。
+
+支持的客户端：
+- macOS Finder / iOS 文件 app
+- Windows 资源管理器
+- Solid Explorer、ES文件浏览器（Android）
+- Cyberduck、Mountain Duck
+- 任何标准 WebDAV 客户端
+
+### 🔐 安全建议
+
+**⚠️ 重要安全提示：**
+
+1. **S3 密钥安全**：创建 Access Key 后，Secret Key 只显示一次。请妥善保管，泄露可能导致未授权访问。
+2. **使用自定义域名**：强烈建议绑定自定义域名并启用 HTTPS，不要使用默认的 `workers.dev` 域名用于生产环境。
+3. **WebDAV 使用 HTTPS**：WebDAV 的 Basic Auth 仅做 Base64 编码（非加密），必须通过 HTTPS 传输。
+4. **定期轮换密钥**：建议定期更换 S3 Access Key，可通过管理后台禁用旧密钥并创建新密钥。
+5. **管理员密码强度**：`ADMIN_PASSWORD` 应使用强密码，因为它是所有认证的基础。
+6. **R2 访问控制**：确保 R2 存储桶没有配置公开访问权限，所有访问应通过 Worker 进行。
+
+### 💰 费用说明
+
+EdgeStash 本身免费，但使用 Cloudflare 服务可能产生费用：
+
+| 项目 | 免费额度 | 超出后费用 |
+|:-----|:---------|:-----------|
+| Workers 请求 | 100,000 次/天 | $0.30 / 百万次 |
+| Workers CPU 时间 | 10ms/请求（免费版） | - |
+| R2 存储 | 10 GB/月 | $0.015 / GB/月 |
+| R2 A 类操作（写入） | 100 万次/月 | $4.50 / 百万次 |
+| R2 B 类操作（读取） | 1000 万次/月 | $0.36 / 百万次 |
+| KV 读取 | 10 万次/天 | $0.50 / 百万次 |
+| KV 写入 | 1,000 次/天 | $5.00 / 百万次 |
+| KV 存储 | 1 GB | $0.50 / GB/月 |
+| 出站流量 | 免费 | 免费 |
+
+**一般使用场景**：个人或小团队使用，大概率在免费额度内，**基本不会产生费用**。
+
+**可能产生费用的场景**：
+- 大量文件操作（通过 S3/WebDAV 频繁读写）
+- 存储超过 10GB 的文件
+- Workers 超出每日 10 万次请求
+
+**建议**：在 Cloudflare Dashboard 中设置用量提醒，避免意外超支。
 
 ## 📚 API 接口参考
 
@@ -141,6 +255,11 @@ EdgeStash 通过一套 RESTful API 提供服务，以下是核心接口列表。
 | `GET`  | `/api/admin/users`             | 列出所有授权用户           |
 | `POST` | `/api/admin/users`             | 创建新用户                 |
 | `DELETE`| `/api/admin/users/:email`      | 删除指定用户               |
+| **S3 密钥管理** |                            |                            |
+| `GET`  | `/api/admin/s3keys`            | 列出所有 S3 Access Key     |
+| `POST` | `/api/admin/s3keys`            | 创建新的 S3 密钥对         |
+| `DELETE`| `/api/admin/s3keys/:id`        | 删除指定 S3 密钥           |
+| `POST` | `/api/admin/s3keys/:id/toggle` | 启用/禁用 S3 密钥          |
 
 ## 📜 开源协议
 
