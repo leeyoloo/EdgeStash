@@ -279,20 +279,55 @@ function encodePathSegments(path) {
  * Look up an R2 object, trying decoded key first then falling back to encoded key.
  * This handles backward compatibility with files stored using URL-encoded names.
  */
-async function r2HeadWithFallback(env, key) {
+/**
+ * Find the actual R2 key for a given logical path.
+ * Handles mixed encoding: folder may be decoded, filename may be encoded (or vice versa).
+ * Returns the matched key or null.
+ */
+async function findR2Key(env, key) {
+  // 1. Exact match
   let obj = await env.R2_BUCKET.head(key);
-  if (!obj && key !== encodePathSegments(key)) {
-    obj = await env.R2_BUCKET.head(encodePathSegments(key));
+  if (obj) return key;
+
+  // 2. Fully encoded
+  const fullyEncoded = encodePathSegments(key);
+  if (fullyEncoded !== key) {
+    obj = await env.R2_BUCKET.head(fullyEncoded);
+    if (obj) return fullyEncoded;
   }
-  return obj;
+
+  // 3. Mixed encoding: list the folder prefix and match by decoded filename
+  const lastSlash = key.lastIndexOf('/');
+  if (lastSlash > 0) {
+    const folderPrefix = key.substring(0, lastSlash + 1);
+    const targetName = key.substring(lastSlash + 1);
+    const listed = await env.R2_BUCKET.list({ prefix: folderPrefix, limit: 100 });
+    for (const o of (listed.objects || [])) {
+      const storedName = o.key.substring(folderPrefix.length);
+      // Compare decoded versions
+      let decodedStored;
+      try { decodedStored = decodeURIComponent(storedName); } catch (e) { decodedStored = storedName; }
+      if (decodedStored === targetName) {
+        return o.key;
+      }
+    }
+  }
+
+  return null;
+}
+
+async function r2HeadWithFallback(env, key) {
+  const foundKey = await findR2Key(env, key);
+  if (!foundKey) return null;
+  if (foundKey !== key) return await env.R2_BUCKET.head(foundKey);
+  return await env.R2_BUCKET.head(key);
 }
 
 async function r2GetWithFallback(env, key, options) {
-  let obj = await env.R2_BUCKET.get(key, options);
-  if (!obj && key !== encodePathSegments(key)) {
-    obj = await env.R2_BUCKET.get(encodePathSegments(key), options);
-  }
-  return obj;
+  const foundKey = await findR2Key(env, key);
+  if (!foundKey) return null;
+  if (foundKey !== key) return await env.R2_BUCKET.get(foundKey, options);
+  return await env.R2_BUCKET.get(key, options);
 }
 
 /**
@@ -818,24 +853,13 @@ async function handleCopyFile(request, env) {
     let destFolder = destination.startsWith('/') ? destination.slice(1) : destination;
     if (!destFolder.endsWith('/')) destFolder += '/';
 
-    // Fallback: try encoded key for files uploaded before URL-decode fix
-    let srcObject = await env.R2_BUCKET.get(srcKey);
-    if (!srcObject) {
-      const encoded = encodePathSegments(srcKey);
-      if (encoded !== srcKey) {
-        srcObject = await env.R2_BUCKET.get(encoded);
-        if (srcObject) srcKey = encoded;
-      }
-    }
-    if (!srcObject) {
-      // Debug: list what's actually in R2 with similar prefix
-      const prefix = srcKey.includes('/') ? srcKey.substring(0, srcKey.lastIndexOf('/') + 1) : '';
-      const listed = await env.R2_BUCKET.list({ prefix, limit: 10 });
-      const keys = (listed.objects || []).map(o => o.key);
-      return jsonResponse({ success: false, message: '源文件不存在', debug: { tried: [srcKey, encodePathSegments(srcKey)], found: keys } }, 404);
-    }
+    // Find actual R2 key (handles mixed encoding)
+    const foundKey = await findR2Key(env, srcKey);
+    if (!foundKey) return jsonResponse({ success: false, message: '源文件不存在' }, 404);
+    srcKey = foundKey;
 
-    const fileName = srcKey.split('/').pop();
+    const srcObject = await env.R2_BUCKET.get(srcKey);
+    const fileName = decodePathSegments(srcKey).split('/').pop();
     const destKey = destFolder + fileName;
 
     await env.R2_BUCKET.put(destKey, srcObject.body, { httpMetadata: srcObject.httpMetadata });
@@ -861,23 +885,13 @@ async function handleMoveFile(request, env) {
     let destFolder = destination.startsWith('/') ? destination.slice(1) : destination;
     if (!destFolder.endsWith('/')) destFolder += '/';
 
-    // Fallback: try encoded key for files uploaded before URL-decode fix
-    let srcObject = await env.R2_BUCKET.get(srcKey);
-    if (!srcObject) {
-      const encoded = encodePathSegments(srcKey);
-      if (encoded !== srcKey) {
-        srcObject = await env.R2_BUCKET.get(encoded);
-        if (srcObject) srcKey = encoded;
-      }
-    }
-    if (!srcObject) {
-      const prefix = srcKey.includes('/') ? srcKey.substring(0, srcKey.lastIndexOf('/') + 1) : '';
-      const listed = await env.R2_BUCKET.list({ prefix, limit: 10 });
-      const keys = (listed.objects || []).map(o => o.key);
-      return jsonResponse({ success: false, message: '源文件不存在', debug: { tried: [srcKey, encodePathSegments(srcKey)], found: keys } }, 404);
-    }
+    // Find actual R2 key (handles mixed encoding)
+    const foundKey = await findR2Key(env, srcKey);
+    if (!foundKey) return jsonResponse({ success: false, message: '源文件不存在' }, 404);
+    srcKey = foundKey;
 
-    const fileName = srcKey.split('/').pop();
+    const srcObject = await env.R2_BUCKET.get(srcKey);
+    const fileName = decodePathSegments(srcKey).split('/').pop();
     const destKey = destFolder + fileName;
 
     // Copy to destination then delete source
